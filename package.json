@@ -1,0 +1,114 @@
+{
+  "name": "mscopilot-chat",
+  "displayName": "MS Copilot Chat",
+  "description": "Microsoft 365 Copilot (BizChat) を VSCode 上で GitHub Copilot のように利用する拡張機能",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Chat",
+    "AI"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "mscopilot.chat",
+        "name": "mscopilot",
+        "fullName": "MS Copilot",
+        "description": "Microsoft 365 Copilot に質問します。#file / #folder で参照を追加できます。",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "resume",
+            "description": "ローカル保存した過去のチャットを呼び出して再開します"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "mscopilot.signIn",
+        "title": "MS Copilot: ブラウザ接続を初期化 / サインイン確認",
+        "category": "MS Copilot"
+      },
+      {
+        "command": "mscopilot.showLog",
+        "title": "MS Copilot: ログを表示",
+        "category": "MS Copilot"
+      }
+    ],
+    "configuration": {
+      "title": "MS Copilot Chat",
+      "properties": {
+        "mscopilot.transport": {
+          "type": "string",
+          "enum": [
+            "cdp",
+            "playwright"
+          ],
+          "default": "cdp",
+          "description": "ブラウザ接続方式。cdp=起動中/専用のEdgeにCDP接続(推奨)、playwright=専用ブラウザを起動。"
+        },
+        "mscopilot.endpointVariant": {
+          "type": "string",
+          "enum": [
+            "office",
+            "cloud"
+          ],
+          "default": "office",
+          "description": "substrate WebSocket のエンドポイント系統。office=substrate.office.com、cloud=substrate.svc.cloud.microsoft。"
+        },
+        "mscopilot.browserPath": {
+          "type": "string",
+          "default": "",
+          "description": "Edge/Chrome の実行ファイルパス。空の場合は既定の場所を自動探索します(Windows)。"
+        },
+        "mscopilot.debugPort": {
+          "type": "number",
+          "default": 9222,
+          "description": "CDP のリモートデバッグポート。"
+        },
+        "mscopilot.userDataDir": {
+          "type": "string",
+          "default": "",
+          "description": "ブラウザのユーザーデータディレクトリ。空の場合は拡張専用の作業用プロファイルを使用します。"
+        },
+        "mscopilot.startUrl": {
+          "type": "string",
+          "default": "https://m365.cloud.microsoft/chat",
+          "description": "サインイン確認とトークン取得に使用する M365 Copilot の URL。"
+        },
+        "mscopilot.maxMentionBytes": {
+          "type": "number",
+          "default": 131072,
+          "description": "#file / #folder で注入するコンテキストの最大バイト数。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production",
+    "typecheck": "tsc --noEmit",
+    "test:offline": "esbuild src/__tests__/offline.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/offline-test.cjs && node dist/offline-test.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "@types/ws": "^8.5.12",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.2",
+    "ws": "^8.18.0"
+  }
+}
