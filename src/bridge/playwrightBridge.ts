@@ -6,8 +6,12 @@ import {
   BrowserSession,
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
+  RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
+  formatInventory,
+  inventoryTokens,
+  isTokenFresh,
   pickSydneyToken,
 } from "./browserSession";
 
@@ -72,22 +76,59 @@ export class PlaywrightBridge implements BrowserSession {
 
   async getToken(force = false): Promise<SubstrateToken> {
     await this.ensureReady();
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const token = await this.acquireToken(force);
+    if (token) {
+      return token;
+    }
+    await this.logTokenInventory();
+    throw new BrowserSessionError(
+      "M365 Copilot の認証トークンを取得できませんでした。",
+      `起動したブラウザで ${this.config.startUrl} を開き、M365 Copilot にサインイン済みか確認してください。` +
+        " コマンド「MS Copilot: トークン取得を診断」で、見つかったトークン候補をログに出力できます。",
+    );
+  }
+
+  async collectRawTokens(): Promise<RawTokenCandidate[]> {
+    await this.ensureReady();
+    return ((await this.page.evaluate(COLLECT_TOKENS_SCRIPT)) as RawTokenCandidate[]) ?? [];
+  }
+
+  async currentUrl(): Promise<string> {
+    try {
+      return this.page ? String(this.page.url()) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
+    const attempts = 4;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
         await this.page.reload({ waitUntil: "domcontentloaded" });
       }
-      const candidates: string[] = await this.page.evaluate(COLLECT_TOKENS_SCRIPT);
-      const token = pickSydneyToken(candidates ?? []);
-      if (token) {
-        log.info(`token acquired (pw): exp=${new Date(token.expiresAt).toISOString()}`);
-        return token;
+      for (let poll = 0; poll < 3; poll++) {
+        const candidates = await this.collectRawTokens();
+        const token = pickSydneyToken(candidates);
+        if (token && isTokenFresh(token)) {
+          log.info(`token acquired (pw): exp=${new Date(token.expiresAt).toISOString()}`);
+          return token;
+        }
+        await delay(1000);
       }
-      await delay(1200);
     }
-    throw new BrowserSessionError(
-      "M365 Copilot の認証トークンを取得できませんでした。",
-      `起動したブラウザで ${this.config.startUrl} を開き、M365 Copilot にサインインしてから再実行してください。`,
-    );
+    return undefined;
+  }
+
+  private async logTokenInventory(): Promise<void> {
+    try {
+      const href = await this.currentUrl();
+      const inv = inventoryTokens(await this.collectRawTokens());
+      log.warn(`token 取得失敗。現在のページ: ${href || "(不明)"}`);
+      log.warn(`検出したトークン候補 ${inv.length} 件:\n${formatInventory(inv)}`);
+    } catch (e) {
+      log.warn("token inventory の収集に失敗", e as Error);
+    }
   }
 
   async runStream(opts: RunStreamOptions): Promise<void> {

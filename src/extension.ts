@@ -2,6 +2,12 @@ import * as vscode from "vscode";
 import { getConfig, MsCopilotConfig } from "./config";
 import { initLogger, log } from "./logger";
 import { BrowserSession, BrowserSessionError, createBrowserSession } from "./bridge";
+import {
+  RawTokenCandidate,
+  formatInventory,
+  inventoryTokens,
+  pickSydneyToken,
+} from "./bridge/browserSession";
 import { SubstrateClient } from "./copilot/substrateClient";
 import { HistoryStore } from "./history/store";
 import { ChatController } from "./chat/participant";
@@ -101,6 +107,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         showSessionError(e);
       }
     }),
+    vscode.commands.registerCommand("mscopilot.diagnoseToken", async () => {
+      try {
+        let candidates: RawTokenCandidate[] = [];
+        let href = "";
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: "トークン取得を診断中…" },
+          async () => {
+            const session = await sessions.get(getConfig());
+            href = await session.currentUrl();
+            candidates = await session.collectRawTokens();
+          },
+        );
+        const inv = inventoryTokens(candidates);
+        const picked = pickSydneyToken(candidates);
+        log.info("=== トークン取得診断 ===");
+        log.info(`現在のページ: ${href || "(不明)"}`);
+        log.info(`検出したトークン候補 ${inv.length} 件(★=採用候補, ○=substrate):\n${formatInventory(inv)}`);
+        if (picked) {
+          const min = Math.round((picked.expiresAt - Date.now()) / 60000);
+          log.info(
+            `→ 選択されるトークン: tenant=${picked.tenantId.slice(0, 8)}… 残り約 ${min} 分` +
+              `(exp=${new Date(picked.expiresAt).toISOString()})`,
+          );
+        } else {
+          log.warn(
+            "→ substrate/sydney に一致する有効なトークンが見つかりませんでした。" +
+              " 上の一覧に候補がある場合は、その aud / scope を browserSession.ts の CHAT_HINTS / SUBSTRATE_HINTS に追加してください。",
+          );
+        }
+        log.show();
+        vscode.window.showInformationMessage(
+          picked
+            ? `トークンを検出しました(候補 ${inv.length} 件)。詳細はログを参照してください。`
+            : `一致するトークンが見つかりませんでした(候補 ${inv.length} 件)。ログを確認してください。`,
+        );
+      } catch (e) {
+        showSessionError(e);
+      }
+    }),
     { dispose: () => void sessions.dispose() },
   );
 }
@@ -129,6 +174,14 @@ class LazySession implements BrowserSession {
 
   async getToken(force?: boolean) {
     return (await this.real()).getToken(force);
+  }
+
+  async collectRawTokens() {
+    return (await this.real()).collectRawTokens();
+  }
+
+  async currentUrl() {
+    return (await this.real()).currentUrl();
   }
 
   async runStream(opts: Parameters<BrowserSession["runStream"]>[0]): Promise<void> {

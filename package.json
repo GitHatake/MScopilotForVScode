@@ -41,6 +41,11 @@
         "command": "mscopilot.showLog",
         "title": "MS Copilot: ログを表示",
         "category": "MS Copilot"
+      },
+      {
+        "command": "mscopilot.diagnoseToken",
+        "title": "MS Copilot: トークン取得を診断",
+        "category": "MS Copilot"
       }
     ],
     "configuration": {

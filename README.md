@@ -51,6 +51,29 @@ Chat ビューを開き `@mscopilot` を選んで質問してください。
 うまくいかない場合はコマンド **「MS Copilot: ブラウザ接続を初期化 / サインイン確認」** で接続を検証、
 **「MS Copilot: ログを表示」** で詳細ログを確認できます。
 
+### トークンが取得できないとき(トラブルシューティング)
+
+「認証トークンを取得できませんでした」と出る場合は、コマンド
+**「MS Copilot: トークン取得を診断」** を実行してください。ブラウザの MSAL キャッシュから
+見つかったトークン候補を **一覧でログ出力** します(現在のページ URL、各候補の `aud` /
+スコープ / 有効期限 / 選別スコアを表示。secret は出しません)。
+
+- **候補が 0 件**: そのページ origin にまだ Copilot トークンが発行されていません。対象ブラウザで
+  実際に `mscopilot.startUrl`(既定 `https://m365.cloud.microsoft/chat`)を開き、Copilot の
+  チャット画面が表示されローカルの一往復ができる状態にしてから再実行してください。別 origin
+  (例: `outlook.office.com`)でログインしている場合は、`mscopilot.startUrl` をそのページに
+  合わせるか、Copilot チャットを一度開いてトークンを発行させます。
+- **候補はあるが ★/○ が付かない(score 0)**: substrate/sydney とみなせる候補が無い状態です。
+  一覧に出ている `aud` やスコープ文字列を確認し、`src/bridge/browserSession.ts` の
+  `CHAT_HINTS` / `SUBSTRATE_HINTS` に該当語を追加すると拾えるようになります(テナントにより
+  スコープ名が異なることがあります)。
+- **★ は付くが「失効」表示**: トークンの寿命(約 60 分)切れです。ブラウザで Copilot を
+  操作するか、拡張側の再取得(`getToken(force)`)で MSAL が更新します。
+
+> トークン選別は audience だけでなく、MSAL の `target`(要求スコープ)と JWT の `scp` も
+> 併せて照合し、有効期限に余裕のある候補を優先します(`pickSydneyToken`)。
+> `aud` が GUID の場合でもスコープ側の語で判別できるようにしてあります。
+
 ### フォールバック(Playwright)
 
 企業ポリシーで Edge のリモートデバッグが禁止されている場合は Playwright 方式を使えます。
@@ -76,6 +99,10 @@ npx playwright install msedge
 
 ## 実機での調整が必要な箇所(重要)
 
+> 📄 実環境からの**データ採取手順**は [`docs/real-env-capture.md`](docs/real-env-capture.md) に
+> まとめてあります(トークンのメタデータ、WebSocket の URL/フレーム、CSP/クローズコードを
+> secret を出さずに採る方法)。まずこれに沿ってデータを採取すると、下記の調整を実測値で行えます。
+
 このプロトコルは実トラフィックでの検証が前提です。以下は実機のブラウザ DevTools(Network → WS)で
 実際のフレームを確認し、必要に応じて調整してください。ログには送受信フレームがそのまま出ます。
 
@@ -85,7 +112,11 @@ npx playwright install msedge
   - `interpretFrame` / `extractText`: 応答本文の取り出し方(messages 配列の想定)。
   - 完了判定に使う `type`(2/3)。
 - **`src/copilot/injectedClient.ts`**: ページ内 WS ランナー。ハンドシェイクや ping 応答の扱い。
-- **`mscopilot.startUrl`**: 相乗りするページ origin(CSP が substrate への接続を許可する必要あり)。
+- **`src/bridge/browserSession.ts`**
+  - `CHAT_HINTS` / `SUBSTRATE_HINTS`: トークン選別に使う語。テナント固有のスコープ名があれば追加。
+    まず「MS Copilot: トークン取得を診断」で実際の `aud` / スコープを確認するのが早いです。
+- **`mscopilot.startUrl`**: 相乗りするページ origin(CSP が substrate への接続を許可し、かつ
+  その origin で Copilot トークンが発行される必要あり)。
 
 ## アーキテクチャ
 
@@ -97,8 +128,10 @@ VSCode拡張(TS)  ──▶  BrowserSession  ──CDP/Playwright──▶  実�
 ```
 
 - 認証: ログイン済みセッションの MSAL キャッシュ(local/sessionStorage)から
-  audience `.../sydney` のアクセストークンを読み取る(無ければ substrate ホストの
-  トークンにフォールバック。`browserSession.ts` の `pickSydneyToken`)。
+  トークン候補を広く収集し(`COLLECT_TOKENS_SCRIPT`)、`target`(スコープ)/ `aud` / `scp` を
+  照合して substrate(sydney)向けの有効なトークンを選ぶ(`browserSession.ts` の
+  `pickSydneyToken`)。sydney が無ければ substrate ホストのトークンへフォールバック。
+  取得に失敗した場合は候補一覧を診断ログへ出力する(`inventoryTokens`)。
 - 発信: WebSocket 接続と送受信は**ブラウザページ内**で実行し、実 UA/TLS/CSP に沿わせる。
   フレームは binding 経由で Node 側へ返し、`protocol.ts` が解釈する。
 
