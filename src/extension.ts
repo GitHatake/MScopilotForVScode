@@ -91,7 +91,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           { location: vscode.ProgressLocation.Notification, title: "MS Copilot に接続中…" },
           async () => {
             const session = await sessions.get(getConfig());
-            const token = await session.getToken(true);
+            //const token = await session.getToken(true);
+            const token = await session.getToken(false);
             vscode.window.showInformationMessage(
               `MS Copilot への接続に成功しました(テナント: ${token.tenantId.slice(0, 8)}…)。`,
             );

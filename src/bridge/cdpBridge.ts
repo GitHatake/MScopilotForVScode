@@ -44,16 +44,40 @@ export class CdpBridge implements BrowserSession {
     if (!(await isPortAlive(port))) {
       await this.launchBrowser(port);
       await waitForPort(port, 20000);
-    }
 
+      // CDP.List上のURLだけでなく、ページの実行コンテキストが
+      // about:blank から目的のページへ切り替わるまで待つ。
+      log.info("CDP: waiting for Copilot page target");
+      await waitForPageTarget(port, this.config.startUrl, 20000);
+    }
+    //ADD==========================================================================================
+    //const target = await this.ensurePageTarget(port);
     const target = await this.ensurePageTarget(port);
+
+    log.info(
+      `CDP: connecting target id=${target.id ?? "(unknown)"} url=${target.url ?? "(unknown)"}`,
+    );
+
     const client = await CDP({ port, target: target.id ?? target });
+    client.on("disconnect", () => {
+      log.error("CDP: client disconnected");
+    });
+    //const client = await CDP({ port, target: target.id ?? target });
+    //==============================================================================================
     try {
+      log.info("CDP: Page.enable start");
       await client.Page.enable();
+      log.info("CDP: Page.enable complete");
+
+      log.info("CDP: Runtime.enable start");
       await client.Runtime.enable();
+      log.info("CDP: Runtime.enable complete");
+
       this.client = client;
-      // 目的の URL でなければ遷移し、読み込みを待つ。
+
+      log.info("CDP: navigateIfNeeded start");
       await this.navigateIfNeeded(this.config.startUrl);
+      log.info("CDP: navigateIfNeeded complete");
     } catch (e) {
       // 半端な状態を残さない。
       this.client = undefined;
@@ -76,6 +100,60 @@ export class CdpBridge implements BrowserSession {
         await this.reload();
       }
       const candidates = await this.evaluate<string[]>(COLLECT_TOKENS_SCRIPT);
+      log.info(`token candidates collected: ${candidates?.length ?? 0}`);
+      //##################################################################
+      const tokenMetadata = await this.evaluate<unknown[]>(`(() => {
+      const out = [];
+
+      const scan = (store, storageName) => {
+        if (!store) return;
+
+        for (let i = 0; i < store.length; i++) {
+          const key = store.key(i);
+          if (!key) continue;
+
+          const raw = store.getItem(key);
+          if (!raw || raw[0] !== "{") continue;
+
+          try {
+            const obj = JSON.parse(raw);
+
+            if (obj?.credentialType === "AccessToken") {
+              out.push({
+                storage: storageName,
+                credentialType: obj.credentialType,
+                target: obj.target ?? null,
+                environment: obj.environment ?? null,
+                realmPresent: Boolean(obj.realm),
+                expiresOn: obj.expiresOn ?? null,
+                extendedExpiresOn: obj.extendedExpiresOn ?? null,
+                tokenType: obj.tokenType ?? null,
+                secretParts:
+                  typeof obj.secret === "string"
+                    ? obj.secret.split(".").length
+                    : null,
+              });
+            }
+          } catch {
+            // JSONでない項目は無視
+          }
+        }
+      };
+
+      try {
+        scan(window.localStorage, "localStorage");
+      } catch {}
+
+      try {
+        scan(window.sessionStorage, "sessionStorage");
+      } catch {}
+
+      return out;
+    })()`);
+
+    log.info(`token cache metadata: ${JSON.stringify(tokenMetadata)}`);
+      //##################################################################
+      
       const token = pickSydneyToken(candidates ?? []);
       if (token) {
         log.info(
@@ -182,11 +260,19 @@ export class CdpBridge implements BrowserSession {
   }
 
   private async navigateIfNeeded(url: string): Promise<void> {
-    const current = await this.evaluate<string>("location.href").catch(() => "");
-    // 空/about:blank のときだけ遷移する。既に Microsoft ドメイン(SSO リダイレクト中を含む)
-    // にいる場合は遷移させない — ログインフローや別タブを壊さないため。
+    const current = await this.evaluate<string>("location.href").catch((e) => {
+      log.error("CDP: location.href evaluation failed", e as Error);
+      return "";
+    });
+
+    log.info(`CDP: current URL=${current || "(empty)"}`);
+    log.info(`CDP: requested URL=${url}`);
+
     if (!current || current === "about:blank" || current.startsWith("chrome://")) {
+      log.info("CDP: Page.navigate start");
       await this.client.Page.navigate({ url });
+      log.info("CDP: Page.navigate complete");
+
       await this.waitForLoad();
     }
   }
@@ -270,6 +356,43 @@ async function waitForPort(port: number, timeoutMs: number): Promise<void> {
   throw new BrowserSessionError(
     "ブラウザのデバッグポートに接続できませんでした。",
     "既にブラウザが起動している場合は一度完全に終了してから再実行するか、mscopilot.debugPort を確認してください。",
+  );
+}
+async function waitForPageTarget(
+  port: number,
+  expectedUrl: string,
+  timeoutMs: number,
+): Promise<void> {
+  const expectedHost = safeHost(expectedUrl);
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const targets: any[] = await CDP.List({ port });
+
+      const target = targets.find(
+        (item) =>
+          item.type === "page" &&
+          expectedHost !== undefined &&
+          safeHost(item.url ?? "") === expectedHost,
+      );
+
+      if (target) {
+        // ターゲット一覧への登録直後は、Runtimeの実行コンテキストが
+        // まだabout:blankの場合があるため、短時間安定するまで待つ。
+        await delay(750);
+        return;
+      }
+    } catch {
+      // Edge起動途中の一時的な失敗は再試行する。
+    }
+
+    await delay(250);
+  }
+
+  throw new BrowserSessionError(
+    "M365 Copilot ページの起動を確認できませんでした。",
+    `対象ブラウザで ${expectedUrl} が開いていることを確認してください。`,
   );
 }
 

@@ -8,6 +8,8 @@
  *    (runStream)。フレームはページ→Node へ push 関数(binding)経由で返す。
  */
 
+import { log } from "../logger";
+
 export interface SubstrateToken {
   /** substrate 用アクセストークン(JWT 本体) */
   accessToken: string;
@@ -95,7 +97,24 @@ export function pickSydneyToken(candidates: string[]): SubstrateToken | undefine
     if (!secret || typeof secret !== "string") {
       continue;
     }
+    log.info(
+      `token shape: length=${secret.length} parts=${secret.split(".").length} ` +
+        `startsWithEyJ=${secret.startsWith("eyJ")}`,
+    );
     const payload = decodeJwt(secret);
+
+    log.info(
+      `token shape: length=${secret.length} parts=${secret.split(".").length} ` +
+        `startsWithEyJ=${secret.startsWith("eyJ")}`,
+    );
+    
+    log.info(
+      `token metadata: aud=${payload?.aud ?? "(none)"} ` +
+        `oid=${payload?.oid ? "present" : "missing"} ` +
+        `tid=${payload?.tid ? "present" : "missing"} ` +
+        `exp=${payload?.exp ?? "(none)"} ` +
+        `scp=${payload?.scp ?? "(none)"}`,
+    );
     if (!payload?.aud || !payload.oid || !payload.tid || !payload.exp) {
       continue;
     }
