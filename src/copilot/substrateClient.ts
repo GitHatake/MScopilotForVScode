@@ -7,10 +7,12 @@ import {
   RECORD_SEP,
   buildInvocation,
   buildWsUrl,
+  deriveWsUrlFromTemplate,
   encodeFrame,
   extractConversationId,
   handshakeFrame,
   interpretFrame,
+  newSessionIds,
   parseFrames,
   pingFrame,
 } from "./protocol";
@@ -46,13 +48,28 @@ export class SubstrateClient {
     const token = await this.session.getToken(params.forceToken);
     const conversationId = params.conversationId ?? randomUUID();
     const isStartOfSession = !params.conversationId;
+    const ids = newSessionIds();
 
-    const endpoint = buildWsUrl(this.config.endpointVariant, token, conversationId);
+    // ページの実接続テンプレートが取れればそれを流用する(実 variants/token/scenario を使え、
+    // 仕様変更に強い)。取れなければ実測値ベースの buildWsUrl でフォールバック。
+    const template = (await this.session.harvestWsTemplate?.()) || undefined;
+    const endpoint =
+      (template && deriveWsUrlFromTemplate(template, conversationId, ids)) ||
+      buildWsUrl(this.config.endpointVariant, token, conversationId, ids);
+    if (template) {
+      log.info("ws endpoint: ページ実接続テンプレートから生成しました");
+    }
+
+    const locale = localeInfo();
     const invocation = buildInvocation({
       prompt: params.prompt,
-      conversationId,
       isStartOfSession,
       invocationId: "0",
+      sessionId: ids.sessionId,
+      correlationId: ids.correlationId,
+      locale: locale.locale,
+      timeZone: locale.timeZone,
+      timeZoneOffset: locale.timeZoneOffset,
     });
 
     const arg = {
@@ -118,6 +135,12 @@ export class SubstrateClient {
         errorText = interp.error;
         log.warn(`frame error: ${interp.error}`);
       }
+      // writeAtCursor は差分なので末尾へ追記する。
+      if (interp.appendText) {
+        lastText += interp.appendText;
+        params.onDelta(interp.appendText);
+      }
+      // messages[].text は累積スナップショットなので差分を取り出す。
       if (interp.fullText !== undefined) {
         const delta = diff(lastText, interp.fullText);
         if (delta) {
@@ -160,6 +183,20 @@ function diff(prev: string, next: string): string {
 
 function redactToken(url: string): string {
   return url.replace(/access_token=[^&]+/, "access_token=***");
+}
+
+/** 実行環境の locale / timezone を invocation.message 用に取得する(取れなければ既定)。 */
+function localeInfo(): { locale: string; timeZone: string; timeZoneOffset: number } {
+  try {
+    const resolved = Intl.DateTimeFormat().resolvedOptions();
+    const locale = (resolved.locale || "en-us").toLowerCase();
+    const timeZone = resolved.timeZone || "UTC";
+    // JS の getTimezoneOffset は「UTC−ローカル」の分。substrate は「ローカル−UTC」の時。
+    const timeZoneOffset = -new Date().getTimezoneOffset() / 60;
+    return { locale, timeZone, timeZoneOffset };
+  } catch {
+    return { locale: "en-us", timeZone: "UTC", timeZoneOffset: 0 };
+  }
 }
 
 function logRawFrame(frame: unknown): void {

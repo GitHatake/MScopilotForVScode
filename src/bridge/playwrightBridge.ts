@@ -6,13 +6,18 @@ import {
   BrowserSession,
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
+  READ_BEARER_SCRIPT,
+  READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
+  WS_HOOK_SCRIPT,
   formatInventory,
   inventoryTokens,
   isTokenFresh,
+  parseWsUrlToken,
   pickSydneyToken,
+  tokenFromSecret,
 } from "./browserSession";
 
 /**
@@ -70,6 +75,13 @@ export class PlaywrightBridge implements BrowserSession {
       }
     });
 
+    // ページ読込前に WebSocket フックを仕込む(ユーザー実接続から token を採取するため)。
+    try {
+      await this.context.addInitScript({ content: WS_HOOK_SCRIPT });
+    } catch (e) {
+      log.warn("addInitScript(WS hook) に失敗", e as Error);
+    }
+
     await this.page.goto(this.config.startUrl, { waitUntil: "domcontentloaded" });
     log.info("Playwright: page ready");
   }
@@ -101,21 +113,61 @@ export class PlaywrightBridge implements BrowserSession {
     }
   }
 
+  async harvestWsTemplate(): Promise<string | undefined> {
+    await this.ensureReady();
+    const url = await this.readHarvestedUrl();
+    return url || undefined;
+  }
+
+  async harvestBearer(): Promise<string | undefined> {
+    await this.ensureReady();
+    const secret = await this.readHarvestedBearer();
+    return secret || undefined;
+  }
+
+  private async readHarvestedUrl(): Promise<string> {
+    try {
+      return this.page ? String((await this.page.evaluate(READ_WS_URL_SCRIPT)) || "") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  private async readHarvestedBearer(): Promise<string> {
+    try {
+      return this.page ? String((await this.page.evaluate(READ_BEARER_SCRIPT)) || "") : "";
+    } catch {
+      return "";
+    }
+  }
+
+  /** 実テナントでは access_token が永続化されないため、3 経路を制限時間内で走査する。 */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
     const attempts = 4;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
         await this.page.reload({ waitUntil: "domcontentloaded" });
       }
-      for (let poll = 0; poll < 3; poll++) {
-        const candidates = await this.collectRawTokens();
-        const token = pickSydneyToken(candidates);
-        if (token && isTokenFresh(token)) {
-          log.info(`token acquired (pw): exp=${new Date(token.expiresAt).toISOString()}`);
-          return token;
+      const budgetMs = attempt === 0 && !force ? 4000 : 12000;
+      const deadline = Date.now() + budgetMs;
+      do {
+        const storage = pickSydneyToken(await this.collectRawTokens());
+        if (storage && isTokenFresh(storage)) {
+          log.info(`token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()}`);
+          return storage;
         }
-        await delay(1000);
-      }
+        const bearer = tokenFromSecret(await this.readHarvestedBearer());
+        if (bearer && isTokenFresh(bearer)) {
+          log.info(`token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()}`);
+          return bearer;
+        }
+        const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
+        if (wsToken && isTokenFresh(wsToken)) {
+          log.info(`token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()}`);
+          return wsToken;
+        }
+        await delay(750);
+      } while (Date.now() < deadline);
     }
     return undefined;
   }

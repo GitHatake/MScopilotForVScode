@@ -6,7 +6,9 @@ import {
   RawTokenCandidate,
   formatInventory,
   inventoryTokens,
+  parseWsUrlToken,
   pickSydneyToken,
+  tokenFromSecret,
 } from "./bridge/browserSession";
 import { SubstrateClient } from "./copilot/substrateClient";
 import { HistoryStore } from "./history/store";
@@ -111,36 +113,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       try {
         let candidates: RawTokenCandidate[] = [];
         let href = "";
+        let wsUrl = "";
+        let bearer = "";
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: "トークン取得を診断中…" },
           async () => {
             const session = await sessions.get(getConfig());
             href = await session.currentUrl();
             candidates = await session.collectRawTokens();
+            wsUrl = (await session.harvestWsTemplate?.()) ?? "";
+            bearer = (await session.harvestBearer?.()) ?? "";
           },
         );
         const inv = inventoryTokens(candidates);
         const picked = pickSydneyToken(candidates);
+        const wsToken = wsUrl ? parseWsUrlToken(wsUrl) : undefined;
+        const bearerToken = bearer ? tokenFromSecret(bearer) : undefined;
+        const remain = (t: { expiresAt: number }) => Math.round((t.expiresAt - Date.now()) / 60000);
         log.info("=== トークン取得診断 ===");
         log.info(`現在のページ: ${href || "(不明)"}`);
         log.info(`検出したトークン候補 ${inv.length} 件(★=採用候補, ○=substrate):\n${formatInventory(inv)}`);
-        if (picked) {
-          const min = Math.round((picked.expiresAt - Date.now()) / 60000);
-          log.info(
-            `→ 選択されるトークン: tenant=${picked.tenantId.slice(0, 8)}… 残り約 ${min} 分` +
-              `(exp=${new Date(picked.expiresAt).toISOString()})`,
-          );
-        } else {
+        log.info("取得経路の状態(上から優先):");
+        log.info(
+          picked
+            ? `  1) MSAL ストレージ: OK(tenant=${picked.tenantId.slice(0, 8)}… 残り約 ${remain(picked)} 分)`
+            : "  1) MSAL ストレージ: なし(このテナントは access_token を永続化しない可能性)",
+        );
+        log.info(
+          bearerToken
+            ? `  2) substrate HTTP の Bearer: OK(tenant=${bearerToken.tenantId.slice(0, 8)}… 残り約 ${remain(bearerToken)} 分)`
+            : "  2) substrate HTTP の Bearer: 未捕捉(ページの substrate 通信をまだ観測していません)",
+        );
+        log.info(
+          wsToken
+            ? `  3) ページ実接続の WebSocket: OK(tenant=${wsToken.tenantId.slice(0, 8)}… 残り約 ${remain(wsToken)} 分)`
+            : "  3) ページ実接続の WebSocket: 未捕捉(チャット接続がまだ張られていません)",
+        );
+        const acquirable = picked || bearerToken || wsToken;
+        if (!acquirable) {
           log.warn(
-            "→ substrate/sydney に一致する有効なトークンが見つかりませんでした。" +
-              " 上の一覧に候補がある場合は、その aud / scope を browserSession.ts の CHAT_HINTS / SUBSTRATE_HINTS に追加してください。",
+            "→ どの経路でもトークンを採取できていません。対象ブラウザで Copilot チャット" +
+              `(${getConfig().startUrl})を開き、ページを表示した状態で数秒待つか、一度メッセージを送ってから再実行してください。`,
           );
         }
         log.show();
+        const via = picked ? "MSALストレージ" : bearerToken ? "HTTP Bearer" : wsToken ? "実接続WS" : "";
         vscode.window.showInformationMessage(
-          picked
-            ? `トークンを検出しました(候補 ${inv.length} 件)。詳細はログを参照してください。`
-            : `一致するトークンが見つかりませんでした(候補 ${inv.length} 件)。ログを確認してください。`,
+          acquirable
+            ? `トークンを取得できます(${via} 経由)。詳細はログを参照してください。`
+            : `トークンを取得できませんでした。ログの案内に従ってください(候補 ${inv.length} 件)。`,
         );
       } catch (e) {
         showSessionError(e);
@@ -182,6 +203,14 @@ class LazySession implements BrowserSession {
 
   async currentUrl() {
     return (await this.real()).currentUrl();
+  }
+
+  async harvestWsTemplate() {
+    return (await this.real()).harvestWsTemplate?.();
+  }
+
+  async harvestBearer() {
+    return (await this.real()).harvestBearer?.();
   }
 
   async runStream(opts: Parameters<BrowserSession["runStream"]>[0]): Promise<void> {

@@ -73,6 +73,19 @@ export interface BrowserSession {
   /** 現在ブラウザで開いている URL(診断表示用)。取得できなければ空文字。 */
   currentUrl(): Promise<string>;
 
+  /**
+   * ページの実接続(ユーザー自身の substrate WebSocket)から捕捉した URL テンプレートを返す。
+   * access_token / variants / scenario など実テナントの実値を含む。捕捉していなければ undefined。
+   * 実装は window.WebSocket をフックして記録する(WS_HOOK_SCRIPT)。
+   */
+  harvestWsTemplate?(): Promise<string | undefined>;
+
+  /**
+   * ページの substrate 宛 HTTP から捕捉した Bearer トークン(JWT 本体)を返す。
+   * チャット WebSocket が開く前でも採取できる主経路。捕捉していなければ undefined。
+   */
+  harvestBearer?(): Promise<string | undefined>;
+
   /** ページ内でストリーミング処理を実行する。script 完了で resolve。 */
   runStream(opts: RunStreamOptions): Promise<void>;
 
@@ -236,6 +249,139 @@ export function pickSydneyToken(
 /** トークンに有効期限の余裕があるか(取得ループの再試行判定に使う)。 */
 export function isTokenFresh(token: SubstrateToken): boolean {
   return token.expiresAt - Date.now() > EXPIRY_MARGIN_MS;
+}
+
+/**
+ * ページ内で実行し、実テナントの substrate トークンを 2 経路で採取するフック。
+ * 実テナントでは access_token が web ストレージに永続化されないことがあるため、
+ * MSAL 走査の代わりにページの実トラフィックから拾う。
+ *
+ *  1) window.WebSocket: substrate 実接続 URL(access_token 付き)を __mscopilotWsUrl に記録。
+ *  2) fetch / XMLHttpRequest: substrate 宛リクエストの Authorization: Bearer を __mscopilotBearer に記録。
+ *     チャット WebSocket が開くのを待たずとも、ページは読込時に substrate へ HTTP を投げるため、
+ *     こちらの方が早く・確実に採取できる(=一発で動きやすい)。
+ *
+ * CDP の addScriptToEvaluateOnNewDocument / Playwright の addInitScript でページ読込前に仕込むこと。
+ * 自分(拡張)が張る接続で上書きしないよう、WS URL はページ読込ごとに最初の 1 本だけ記録する。
+ */
+export const WS_HOOK_SCRIPT = `(() => {
+  try {
+    if (window.__mscopilotHooked) return;
+    window.__mscopilotHooked = true;
+    var SUB = /substrate\\.(office\\.com|svc\\.cloud\\.microsoft)/i;
+    var captureBearer = function (auth) {
+      try {
+        if (!auth) return;
+        var m = /Bearer\\s+([A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+)/i.exec(String(auth));
+        if (m) globalThis.__mscopilotBearer = m[1];
+      } catch (e) {}
+    };
+    var headerGet = function (h, name) {
+      try {
+        if (!h) return "";
+        var lower = name.toLowerCase();
+        if (typeof h.get === "function") return h.get(name) || "";
+        if (Array.isArray(h)) {
+          for (var i = 0; i < h.length; i++) if (String(h[i][0]).toLowerCase() === lower) return h[i][1];
+          return "";
+        }
+        for (var k in h) if (k.toLowerCase() === lower) return h[k];
+      } catch (e) {}
+      return "";
+    };
+
+    // 1) WebSocket
+    var OW = window.WebSocket;
+    var WrapWS = function (url, protocols) {
+      try {
+        var u = String(url);
+        if (!globalThis.__mscopilotWsUrl && u.indexOf("/Chathub/") !== -1 && u.indexOf("access_token=") !== -1) {
+          globalThis.__mscopilotWsUrl = u;
+        }
+      } catch (e) {}
+      return protocols !== undefined ? new OW(url, protocols) : new OW(url);
+    };
+    WrapWS.prototype = OW.prototype;
+    WrapWS.CONNECTING = OW.CONNECTING; WrapWS.OPEN = OW.OPEN;
+    WrapWS.CLOSING = OW.CLOSING; WrapWS.CLOSED = OW.CLOSED;
+    window.WebSocket = WrapWS;
+
+    // 2) fetch
+    var of = window.fetch;
+    if (typeof of === "function") {
+      window.fetch = function (input, init) {
+        try {
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          if (SUB.test(url)) {
+            var auth = init && init.headers ? headerGet(init.headers, "authorization") : "";
+            if (!auth && input && input.headers && typeof input.headers.get === "function") {
+              auth = input.headers.get("authorization") || "";
+            }
+            captureBearer(auth);
+          }
+        } catch (e) {}
+        return of.apply(this, arguments);
+      };
+    }
+
+    // 3) XMLHttpRequest
+    var XP = XMLHttpRequest.prototype;
+    var oOpen = XP.open, oSet = XP.setRequestHeader;
+    XP.open = function (method, url) {
+      try { this.__mscUrl = String(url || ""); } catch (e) {}
+      return oOpen.apply(this, arguments);
+    };
+    XP.setRequestHeader = function (key, value) {
+      try {
+        if (String(key).toLowerCase() === "authorization" && SUB.test(this.__mscUrl || "")) captureBearer(value);
+      } catch (e) {}
+      return oSet.apply(this, arguments);
+    };
+  } catch (e) {}
+})()`;
+
+/** 捕捉済みの substrate 接続 URL を返すスクリプト式(無ければ空文字)。 */
+export const READ_WS_URL_SCRIPT = `(globalThis.__mscopilotWsUrl || "")`;
+
+/** 捕捉済みの substrate 宛 Bearer トークン(JWT 本体)を返すスクリプト式(無ければ空文字)。 */
+export const READ_BEARER_SCRIPT = `(globalThis.__mscopilotBearer || "")`;
+
+/**
+ * JWT 本体(secret)から SubstrateToken を組み立てる。oid/tid が読めない JWT は対象外。
+ * exp が読めない場合は保守的に 50 分後を仮の失効時刻とする。
+ */
+export function tokenFromSecret(secret: string | undefined): SubstrateToken | undefined {
+  if (!secret) {
+    return undefined;
+  }
+  const payload = decodeJwt(secret);
+  if (!payload?.oid || !payload.tid) {
+    return undefined;
+  }
+  const expiresAt = payload.exp ? payload.exp * 1000 : Date.now() + 50 * 60_000;
+  return { accessToken: secret, objectId: payload.oid, tenantId: payload.tid, expiresAt };
+}
+
+/**
+ * 捕捉した WebSocket URL から access_token を取り出し SubstrateToken を組み立てる。
+ * oid/tid は JWT claim を優先し、無ければ URL パス({oid}@{tid})から補う。
+ * exp が読めない場合は保守的に 50 分後を仮の失効時刻とする。
+ */
+export function parseWsUrlToken(url: string): SubstrateToken | undefined {
+  const m = /[?&]access_token=([^&]+)/.exec(url);
+  if (!m) {
+    return undefined;
+  }
+  const secret = decodeURIComponent(m[1]);
+  const payload = decodeJwt(secret);
+  const pathMatch = /\/Chathub\/([^@/?]+)@([^/?]+)/.exec(url);
+  const objectId = payload?.oid || (pathMatch ? decodeURIComponent(pathMatch[1]) : undefined);
+  const tenantId = payload?.tid || (pathMatch ? decodeURIComponent(pathMatch[2]) : undefined);
+  if (!objectId || !tenantId) {
+    return undefined;
+  }
+  const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + 50 * 60_000;
+  return { accessToken: secret, objectId, tenantId, expiresAt };
 }
 
 export interface TokenInventoryEntry {

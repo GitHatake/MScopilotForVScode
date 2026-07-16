@@ -54,25 +54,35 @@ Chat ビューを開き `@mscopilot` を選んで質問してください。
 ### トークンが取得できないとき(トラブルシューティング)
 
 「認証トークンを取得できませんでした」と出る場合は、コマンド
-**「MS Copilot: トークン取得を診断」** を実行してください。ブラウザの MSAL キャッシュから
-見つかったトークン候補を **一覧でログ出力** します(現在のページ URL、各候補の `aud` /
-スコープ / 有効期限 / 選別スコアを表示。secret は出しません)。
+**「MS Copilot: トークン取得を診断」** を実行してください。2 系統の取得経路の状態を
+**ログ出力** します(現在のページ URL、MSAL 候補の一覧、ページ実接続からの採取可否。
+secret は出しません)。
 
-- **候補が 0 件**: そのページ origin にまだ Copilot トークンが発行されていません。対象ブラウザで
-  実際に `mscopilot.startUrl`(既定 `https://m365.cloud.microsoft/chat`)を開き、Copilot の
-  チャット画面が表示されローカルの一往復ができる状態にしてから再実行してください。別 origin
-  (例: `outlook.office.com`)でログインしている場合は、`mscopilot.startUrl` をそのページに
-  合わせるか、Copilot チャットを一度開いてトークンを発行させます。
-- **候補はあるが ★/○ が付かない(score 0)**: substrate/sydney とみなせる候補が無い状態です。
-  一覧に出ている `aud` やスコープ文字列を確認し、`src/bridge/browserSession.ts` の
-  `CHAT_HINTS` / `SUBSTRATE_HINTS` に該当語を追加すると拾えるようになります(テナントにより
-  スコープ名が異なることがあります)。
-- **★ は付くが「失効」表示**: トークンの寿命(約 60 分)切れです。ブラウザで Copilot を
-  操作するか、拡張側の再取得(`getToken(force)`)で MSAL が更新します。
+トークンの取得経路は 3 つあり、上から順に試します。**テナントによっては access_token が
+web ストレージに永続化されない**(`cacheLocation: memoryStorage` 等)ため、実測では 2) が主経路です。
 
-> トークン選別は audience だけでなく、MSAL の `target`(要求スコープ)と JWT の `scp` も
-> 併せて照合し、有効期限に余裕のある候補を優先します(`pickSydneyToken`)。
-> `aud` が GUID の場合でもスコープ側の語で判別できるようにしてあります。
+1. **MSAL キャッシュ走査**: local/sessionStorage の候補を `target`/`aud`/`scp` で照合(`pickSydneyToken`)。
+2. **substrate HTTP の Bearer 採取**: `fetch` / `XMLHttpRequest` をフックし、ページが substrate へ
+   送る `Authorization: Bearer` を採取します(`tokenFromSecret`)。チャット接続を待たずに拾えるため、
+   **対象ページを開いて数秒待つだけ**で取得できることが多いです。
+3. **ページ実接続の WebSocket 採取**: `window.WebSocket` をフックし、実接続 URL から `access_token` を
+   採取(`parseWsUrlToken`)。実接続が張られていれば最も確実(URL テンプレートも同時に得られます)。
+
+診断ログの読み方(「取得経路の状態」に 3 経路の OK / 未捕捉が出ます):
+
+- **3 経路すべて「なし / 未捕捉」**: 対象ブラウザで Copilot(`mscopilot.startUrl`)を開いた状態で
+  **数秒待って**再実行してください。それでも駄目なら**一度メッセージを送る**と実接続が張られます。
+- **MSAL 候補が 0 件 / IdToken のみ**: そのテナントは access_token をストレージに残さないタイプです
+  (正常)。2) か 3) が OK なら発信できます。
+- **候補はあるが ★/○ が付かない(score 0)**: 一覧の `aud` / スコープを確認し、
+  `src/bridge/browserSession.ts` の `CHAT_HINTS` / `SUBSTRATE_HINTS` に該当語を追加すると拾えます。
+- **「残り約 N 分」が短い / 失効**: トークン寿命(約 60 分)切れです。ブラウザで Copilot を操作するか、
+  拡張側の再取得(`getToken(force)`)で更新されます。
+
+> 発信 URL は、ページ実接続を捕捉できた場合はそのテンプレートを流用します
+> (`deriveWsUrlFromTemplate`)。実テナントの `variants` / `scenario` / `access_token` を
+> そのまま使い、セッション ID と `ConversationId` だけ差し替えるため、Microsoft 側の
+> パラメータ変更にも強くなります。捕捉できない場合は実測値ベースの `buildWsUrl` を使います。
 
 ### フォールバック(Playwright)
 
@@ -103,20 +113,25 @@ npx playwright install msedge
 > まとめてあります(トークンのメタデータ、WebSocket の URL/フレーム、CSP/クローズコードを
 > secret を出さずに採る方法)。まずこれに沿ってデータを採取すると、下記の調整を実測値で行えます。
 
-このプロトコルは実トラフィックでの検証が前提です。以下は実機のブラウザ DevTools(Network → WS)で
-実際のフレームを確認し、必要に応じて調整してください。ログには送受信フレームがそのまま出ます。
+プロトコル値は **2026/7 の実トラフィック(officeweb / `m365.cloud.microsoft`)を実測**して反映済みです。
+それでも Microsoft 側の変更で調整が要る場合、以下を実機のブラウザ DevTools で確認してください。
+ログには送受信フレームがそのまま出ます。
 
-- **`src/copilot/protocol.ts`**
-  - `buildWsUrl`: エンドポイントのパス/クエリ。`endpointVariant` で 2 系統を切替。
-  - `buildInvocation`: type4 ペイロードの `source` / `scenario` / `optionsSets` / `message` 形。
-  - `interpretFrame` / `extractText`: 応答本文の取り出し方(messages 配列の想定)。
-  - 完了判定に使う `type`(2/3)。
+- **`src/copilot/protocol.ts`**(実測反映済み)
+  - `buildWsUrl`: `wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tid}?…`(実測パス/クエリ)。
+    ただし通常は下記テンプレート流用が優先されます。
+  - `deriveWsUrlFromTemplate`: ページ実接続 URL を流用し session/ConversationId のみ差し替え(推奨経路)。
+  - `buildInvocation`: type4 ペイロード(`source:"officeweb"` / `optionsSets` / `tone:"Magic"` 等)。
+  - `interpretFrame` / `extractText` / `extractAppend`: `messages[].text`(スナップショット)と
+    `writeAtCursor`(差分)の両対応。完了は type2/3。
 - **`src/copilot/injectedClient.ts`**: ページ内 WS ランナー。ハンドシェイクや ping 応答の扱い。
 - **`src/bridge/browserSession.ts`**
-  - `CHAT_HINTS` / `SUBSTRATE_HINTS`: トークン選別に使う語。テナント固有のスコープ名があれば追加。
-    まず「MS Copilot: トークン取得を診断」で実際の `aud` / スコープを確認するのが早いです。
-- **`mscopilot.startUrl`**: 相乗りするページ origin(CSP が substrate への接続を許可し、かつ
-  その origin で Copilot トークンが発行される必要あり)。
+  - `WS_HOOK_SCRIPT`: `WebSocket` / `fetch` / `XMLHttpRequest` をフックし、substrate の
+    `access_token`(WS URL)と `Authorization: Bearer`(HTTP)を採取(主経路)。
+  - `tokenFromSecret` / `parseWsUrlToken`: 採取した JWT を SubstrateToken 化。
+  - `CHAT_HINTS` / `SUBSTRATE_HINTS`: MSAL 走査でのトークン選別語(補助経路)。
+- **`mscopilot.startUrl`**: 相乗りするページ origin(実測 `https://m365.cloud.microsoft/chat`。
+  CSP が substrate への接続を許可し、かつその origin で Copilot 実接続が張られる必要あり)。
 
 ## アーキテクチャ
 
@@ -127,13 +142,15 @@ VSCode拡張(TS)  ──▶  BrowserSession  ──CDP/Playwright──▶  実�
   ローカル履歴          SubstrateClient(フレーム構築/解析: protocol.ts)
 ```
 
-- 認証: ログイン済みセッションの MSAL キャッシュ(local/sessionStorage)から
-  トークン候補を広く収集し(`COLLECT_TOKENS_SCRIPT`)、`target`(スコープ)/ `aud` / `scp` を
-  照合して substrate(sydney)向けの有効なトークンを選ぶ(`browserSession.ts` の
-  `pickSydneyToken`)。sydney が無ければ substrate ホストのトークンへフォールバック。
-  取得に失敗した場合は候補一覧を診断ログへ出力する(`inventoryTokens`)。
+- 認証: 2 系統。(1) MSAL キャッシュ(local/sessionStorage)から候補を収集し
+  `target`/`aud`/`scp` で照合(`pickSydneyToken`)。(2) それが空/失効なら、`window.WebSocket` を
+  フックしてユーザー自身の Copilot 実接続 URL から `access_token` を採取(`parseWsUrlToken`)。
+  **実テナントでは access_token がストレージに永続化されないことがあり、(2) が主経路**になる。
+  取得失敗時は両経路の状態を診断ログへ出力する。
 - 発信: WebSocket 接続と送受信は**ブラウザページ内**で実行し、実 UA/TLS/CSP に沿わせる。
-  フレームは binding 経由で Node 側へ返し、`protocol.ts` が解釈する。
+  接続 URL は捕捉した実接続テンプレートを流用(`deriveWsUrlFromTemplate`)し、実 `variants` や
+  `access_token` をそのまま使う。フレームは binding 経由で Node 側へ返し、`protocol.ts` が
+  `messages[].text`(スナップショット)と `writeAtCursor`(差分)を解釈する。
 
 ## 開発
 

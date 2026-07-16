@@ -9,13 +9,18 @@ import {
   BrowserSession,
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
+  READ_BEARER_SCRIPT,
+  READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
+  WS_HOOK_SCRIPT,
   formatInventory,
   inventoryTokens,
   isTokenFresh,
+  parseWsUrlToken,
   pickSydneyToken,
+  tokenFromSecret,
 } from "./browserSession";
 
 /**
@@ -48,14 +53,26 @@ export class CdpBridge implements BrowserSession {
     if (!(await isPortAlive(port))) {
       await this.launchBrowser(port);
       await waitForPort(port, 20000);
+      // 起動直後は CDP.List が about:blank しか返さず、実行コンテキストも未準備なことがある。
+      // 目的ページ(またはログインリダイレクト)が現れるまで待ってから接続する。
+      await waitForPageReady(port, this.config.startUrl, 20000);
     }
 
     const target = await this.ensurePageTarget(port);
     const client = await CDP({ port, target: target.id ?? target });
+    client.on("disconnect", () => log.warn("CDP: client disconnected"));
     try {
       await client.Page.enable();
       await client.Runtime.enable();
       this.client = client;
+      // ページ読込前に WebSocket フックを仕込む(ユーザー実接続から token を採取するため)。
+      // 既に読み込み済みのタブにも即時適用しておく。
+      try {
+        await client.Page.addScriptToEvaluateOnNewDocument({ source: WS_HOOK_SCRIPT });
+      } catch {
+        /* 一部の環境では未対応。即時 evaluate 側で代替する。 */
+      }
+      await this.evaluate(WS_HOOK_SCRIPT).catch(() => undefined);
       // 目的の URL でなければ遷移し、読み込みを待つ。
       await this.navigateIfNeeded(this.config.startUrl);
     } catch (e) {
@@ -98,9 +115,40 @@ export class CdpBridge implements BrowserSession {
     return this.evaluate<string>("location.href").catch(() => "");
   }
 
+  async harvestWsTemplate(): Promise<string | undefined> {
+    await this.ensureReady();
+    const url = await this.readHarvestedUrl();
+    return url || undefined;
+  }
+
+  async harvestBearer(): Promise<string | undefined> {
+    await this.ensureReady();
+    const secret = await this.readHarvestedBearer();
+    return secret || undefined;
+  }
+
+  private async readHarvestedUrl(): Promise<string> {
+    if (!this.client) {
+      return "";
+    }
+    return this.evaluate<string>(READ_WS_URL_SCRIPT).catch(() => "");
+  }
+
+  private async readHarvestedBearer(): Promise<string> {
+    if (!this.client) {
+      return "";
+    }
+    return this.evaluate<string>(READ_BEARER_SCRIPT).catch(() => "");
+  }
+
   /**
-   * トークン取得の本体。MSAL の silent 取得が完了するまで時間がかかることがあるため、
-   * 「再読込 → 数回ポーリング」を複数回繰り返す。有効期限に余裕のあるトークンだけ採用する。
+   * トークン取得の本体。実テナントでは access_token が web ストレージに残らないため、
+   * 「再読込 → 一定時間ポーリング」を繰り返しつつ 3 経路を試す。
+   * 有効期限に余裕のあるトークンだけ採用する。
+   *
+   *  1) MSAL キャッシュ(local/sessionStorage)走査 → pickSydneyToken
+   *  2) ページ substrate 宛 HTTP の Bearer 採取(WebSocket を待たずに拾える主経路)
+   *  3) ページ実接続の WebSocket URL からの採取(実接続が張られていれば最も確実)
    */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
     const attempts = 4;
@@ -108,19 +156,38 @@ export class CdpBridge implements BrowserSession {
       if ((force && attempt === 0) || attempt > 0) {
         await this.reload();
       }
-      // 1 回の読み込み後も MSAL 反映まで間があるので、数回に分けて走査する。
-      for (let poll = 0; poll < 3; poll++) {
-        const candidates = await this.collectRawTokens();
-        const token = pickSydneyToken(candidates);
-        if (token && isTokenFresh(token)) {
-          log.info(
-            `token acquired: oid=${token.objectId.slice(0, 8)}… tid=${token.tenantId.slice(0, 8)}… exp=${new Date(token.expiresAt).toISOString()}`,
-          );
-          return token;
-        }
-        await delay(1000);
+      // 読込直後は substrate への実トラフィックが立ち上がるまで間がある。
+      // 初回は短め、再読込後はページ全体が動くまで長めに待つ。
+      const budgetMs = attempt === 0 && !force ? 4000 : 12000;
+      const token = await this.pollTokenSources(budgetMs);
+      if (token) {
+        return token;
       }
     }
+    return undefined;
+  }
+
+  /** 制限時間内で 3 経路を繰り返し走査し、最初に得られた有効トークンを返す。 */
+  private async pollTokenSources(budgetMs: number): Promise<SubstrateToken | undefined> {
+    const deadline = Date.now() + budgetMs;
+    do {
+      const storage = pickSydneyToken(await this.collectRawTokens());
+      if (storage && isTokenFresh(storage)) {
+        logAcquired("storage", storage);
+        return storage;
+      }
+      const bearer = tokenFromSecret(await this.readHarvestedBearer());
+      if (bearer && isTokenFresh(bearer)) {
+        logAcquired("http-bearer", bearer);
+        return bearer;
+      }
+      const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
+      if (wsToken && isTokenFresh(wsToken)) {
+        logAcquired("ws-harvest", wsToken);
+        return wsToken;
+      }
+      await delay(750);
+    } while (Date.now() < deadline);
     return undefined;
   }
 
@@ -317,6 +384,36 @@ async function waitForPort(port: number, timeoutMs: number): Promise<void> {
   );
 }
 
+/**
+ * ブラウザ起動直後、接続に足るページが現れるまで待つ(ベストエフォート)。
+ * 目的ホストのページが出れば最良。無くても、about:blank 以外へ遷移が始まっていれば
+ * 良しとする(SSO で login.microsoftonline.com 等へリダイレクト中の初回ログインを許容)。
+ * タイムアウトしても致命ではないため throw せず、後続の遷移処理に委ねる。
+ */
+async function waitForPageReady(port: number, expectedUrl: string, timeoutMs: number): Promise<void> {
+  const expectedHost = safeHost(expectedUrl);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const pages = (await CDP.List({ port })).filter((t: any) => t.type === "page");
+      const onHost = pages.some((t: any) => expectedHost && safeHost(t.url ?? "") === expectedHost);
+      const navigated = pages.some((t: any) => {
+        const u = t.url ?? "";
+        return u && u !== "about:blank" && !u.startsWith("chrome://");
+      });
+      if (onHost || navigated) {
+        // 一覧登録直後は実行コンテキストが未安定なことがあるため少し待つ。
+        await delay(750);
+        return;
+      }
+    } catch {
+      // 起動途中の一時的失敗は再試行。
+    }
+    await delay(250);
+  }
+  log.warn("CDP: Copilot ページの起動確認がタイムアウトしました(続行します)");
+}
+
 function safeHost(url: string): string | undefined {
   try {
     return new URL(url).host;
@@ -354,6 +451,13 @@ function findBrowser(): string | undefined {
     );
   }
   return candidates.find((p) => p && existsSync(p));
+}
+
+function logAcquired(via: string, token: SubstrateToken): void {
+  log.info(
+    `token acquired (${via}): oid=${token.objectId.slice(0, 8)}… tid=${token.tenantId.slice(0, 8)}… ` +
+      `exp=${new Date(token.expiresAt).toISOString()}`,
+  );
 }
 
 function delay(ms: number): Promise<void> {

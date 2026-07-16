@@ -4,13 +4,17 @@ import assert from "node:assert";
 import {
   pickSydneyToken,
   inventoryTokens,
+  parseWsUrlToken,
+  tokenFromSecret,
   COLLECT_TOKENS_SCRIPT,
+  WS_HOOK_SCRIPT,
   RawTokenCandidate,
 } from "../bridge/browserSession";
 import { RUN_STREAM_SCRIPT } from "../copilot/injectedClient";
 import {
   buildWsUrl,
   buildInvocation,
+  deriveWsUrlFromTemplate,
   encodeFrame,
   handshakeFrame,
   parseFrames,
@@ -143,11 +147,50 @@ console.log("WebSocket URL:");
 ok("office/cloud で正しいホストとクエリを組む", () => {
   const token = { accessToken: "TKN", objectId: "OID", tenantId: "TID", expiresAt: Date.now() + 1e6 };
   const office = buildWsUrl("office", token, "CONV-1");
-  assert.ok(office.url.startsWith("wss://substrate.office.com/m365chat/SecuredChathub/OID@TID?"));
+  assert.ok(office.url.startsWith("wss://substrate.office.com/m365Copilot/Chathub/OID@TID?"));
   assert.ok(office.url.includes("ConversationId=CONV-1"));
   assert.ok(office.url.includes("access_token=TKN"));
+  assert.ok(office.url.includes("source=%22officeweb%22"), "source は officeweb");
+  assert.ok(office.url.includes("scenario=OfficeWebIncludedCopilot"));
   const cloud = buildWsUrl("cloud", token);
   assert.ok(cloud.url.startsWith("wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub/OID@TID?"));
+});
+ok("テンプレートからは token/variants を流用し session/ConversationId のみ差し替え", () => {
+  const template =
+    "wss://substrate.office.com/m365Copilot/Chathub/OID@TID?chatsessionid=OLD&X-SessionId=OLD-D&" +
+    "ConversationId=PAGE-CONV&access_token=REALTOKEN&variants=a,b,c&source=%22officeweb%22";
+  const ep = deriveWsUrlFromTemplate(template, "MY-CONV")!;
+  assert.ok(ep, "テンプレートから生成できること");
+  assert.ok(ep.url.includes("access_token=REALTOKEN"), "実 token を流用");
+  assert.ok(ep.url.includes("variants=a,b,c"), "実 variants を流用");
+  assert.ok(ep.url.includes("ConversationId=MY-CONV"), "ConversationId は差し替え");
+  assert.ok(!ep.url.includes("PAGE-CONV"), "ページの ConversationId は残さない");
+  assert.ok(!ep.url.includes("chatsessionid=OLD"), "session id は差し替え");
+});
+ok("parseWsUrlToken は URL から token を取り出す(oid/tid は path 補完)", () => {
+  const secret = jwt({ exp: FUTURE }); // oid/tid を含まない token
+  const url = `wss://substrate.office.com/m365Copilot/Chathub/OID-P@TID-P?access_token=${secret}&x=1`;
+  const t = parseWsUrlToken(url)!;
+  assert.ok(t, "取り出せること");
+  assert.equal(t.accessToken, secret);
+  assert.equal(t.objectId, "OID-P", "oid は path から");
+  assert.equal(t.tenantId, "TID-P", "tid は path から");
+  assert.equal(t.expiresAt, FUTURE * 1000);
+});
+ok("tokenFromSecret は oid/tid/exp を持つ JWT を SubstrateToken 化する", () => {
+  const secret = jwt({ oid: "O", tid: "T", exp: FUTURE });
+  const t = tokenFromSecret(secret)!;
+  assert.ok(t);
+  assert.equal(t.objectId, "O");
+  assert.equal(t.tenantId, "T");
+  assert.equal(t.expiresAt, FUTURE * 1000);
+  // oid/tid が無い JWT は対象外(URL パス補完が無いと WS URL を組めないため)。
+  assert.equal(tokenFromSecret(jwt({ exp: FUTURE })), undefined);
+  assert.equal(tokenFromSecret(""), undefined);
+});
+ok("WS_HOOK_SCRIPT は有効な JS 式として解析できる", () => {
+  // ブラウザ globals は無いが、正規表現エスケープ等の構文エラーは検出できる。
+  assert.doesNotThrow(() => new Function(`return (${WS_HOOK_SCRIPT})`));
 });
 
 console.log("SignalR フレーム:");
@@ -156,11 +199,25 @@ ok("handshake は 0x1e 終端", () => {
   assert.ok(h.endsWith(RECORD_SEP));
   assert.deepEqual(JSON.parse(h.slice(0, -1)), { protocol: "json", version: 1 });
 });
-ok("invocation は type4 target=chat", () => {
-  const inv = buildInvocation({ prompt: "こんにちは", conversationId: "C", isStartOfSession: true, invocationId: "0" });
+ok("invocation は type4 target=chat(officeweb 形)", () => {
+  const inv = buildInvocation({
+    prompt: "こんにちは",
+    isStartOfSession: true,
+    invocationId: "0",
+    sessionId: "SID-D",
+    correlationId: "CID",
+  });
   assert.equal((inv as any).type, 4);
   assert.equal((inv as any).target, "chat");
-  assert.equal((inv as any).arguments[0].message.text, "こんにちは");
+  const a = (inv as any).arguments[0];
+  assert.equal(a.message.text, "こんにちは");
+  assert.equal(a.source, "officeweb");
+  assert.equal(a.tone, "Magic");
+  assert.equal(a.sessionId, "SID-D");
+  assert.equal(a.traceId, "CID");
+  assert.equal(a.message.requestId, "CID");
+  // conversationId は URL 側で渡すため arguments には含めない。
+  assert.equal(a.conversationId, undefined);
 });
 ok("parseFrames は 0x1e 区切りを分解", () => {
   const buf = encodeFrame({ a: 1 }) + encodeFrame({ b: 2 }) + '{"partial":';
@@ -197,8 +254,50 @@ ok("内部メッセージのみなら本文なし", () => {
   };
   assert.equal(interpretFrame(frame).fullText, undefined);
 });
+ok("writeAtCursor は差分(appendText)として取り出す", () => {
+  const frame = { type: 1, target: "update", arguments: [{ writeAtCursor: " I help you today" }] };
+  const r = interpretFrame(frame);
+  assert.equal(r.appendText, " I help you today");
+  assert.equal(r.fullText, undefined, "差分フレームでは fullText は出さない");
+});
+ok("スナップショット→差分→最終スナップショットで正しく累積", () => {
+  // 実測の hello 応答の流れを再現し、累積本文が壊れないことを確認。
+  let text = "";
+  const apply = (frame: unknown) => {
+    const i = interpretFrame(frame);
+    if (i.appendText) {
+      text += i.appendText;
+    }
+    if (i.fullText !== undefined) {
+      text = i.fullText.startsWith(text) ? i.fullText : text + i.fullText;
+    }
+  };
+  const snap = (t: string) => ({ type: 1, arguments: [{ messages: [{ author: "bot", text: t }] }] });
+  const delta = (t: string) => ({ type: 1, arguments: [{ writeAtCursor: t }] });
+  apply(snap("Hello! How can"));
+  apply(delta(" I help you today"));
+  apply(delta("?"));
+  apply(snap("Hello! How can I help you today? 😊"));
+  assert.equal(text, "Hello! How can I help you today? 😊");
+});
 ok("completion(type3)で done", () => {
   assert.equal(interpretFrame({ type: 3, invocationId: "0" }).done, true);
+});
+ok("type2 の item.conversationId と bot 本文を拾う", () => {
+  const frame = {
+    type: 2,
+    invocationId: "0",
+    item: {
+      messages: [
+        { author: "user", text: "hello" },
+        { author: "bot", text: "Hello! How can I help you today? 😊", turnState: "Completed" },
+      ],
+      conversationId: "SRV-CONV",
+      result: { value: "Success" },
+    },
+  };
+  assert.equal(extractConversationId(frame), "SRV-CONV");
+  assert.equal(interpretFrame(frame).fullText, "Hello! How can I help you today? 😊");
 });
 ok("ping(type6)を検出", () => {
   assert.equal(interpretFrame({ type: 6 }).isPing, true);
