@@ -34,7 +34,6 @@ import {
  */
 export class CdpBridge implements BrowserSession {
   private client: any | undefined;
-  private launched = false;
   private readonly workProfile: string;
 
   constructor(
@@ -407,7 +406,6 @@ export class CdpBridge implements BrowserSession {
     log.info(`launching browser: ${bin} (profile: ${this.workProfile})`);
     const child = spawn(bin, args, { detached: true, stdio: "ignore" });
     child.unref();
-    this.launched = true;
   }
 }
 
