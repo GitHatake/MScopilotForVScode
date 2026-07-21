@@ -60,7 +60,15 @@ export class CdpBridge implements BrowserSession {
 
     const target = await this.ensurePageTarget(port);
     const client = await CDP({ port, target: target.id ?? target });
-    client.on("disconnect", () => log.warn("CDP: client disconnected"));
+    client.on("disconnect", () => {
+      log.warn("CDP: client disconnected");
+      // 切断(SSO リダイレクトでのタブ再生成やユーザー操作)を検知したら、
+      // 死んだクライアントを掴み続けない。次の操作で ensureReady が再接続する。
+      // 既に別クライアントへ張り替え済みなら触らない。
+      if (this.client === client) {
+        this.client = undefined;
+      }
+    });
     try {
       await client.Page.enable();
       await client.Runtime.enable();
@@ -90,7 +98,7 @@ export class CdpBridge implements BrowserSession {
 
   async getToken(force = false): Promise<SubstrateToken> {
     await this.ensureReady();
-    const token = await this.acquireToken(force);
+    const token = await this.withReconnect(() => this.acquireToken(force));
     if (token) {
       return token;
     }
@@ -105,7 +113,9 @@ export class CdpBridge implements BrowserSession {
 
   async collectRawTokens(): Promise<RawTokenCandidate[]> {
     await this.ensureReady();
-    return (await this.evaluate<RawTokenCandidate[]>(COLLECT_TOKENS_SCRIPT)) ?? [];
+    return this.withReconnect(
+      async () => (await this.evaluate<RawTokenCandidate[]>(COLLECT_TOKENS_SCRIPT)) ?? [],
+    );
   }
 
   async currentUrl(): Promise<string> {
@@ -272,7 +282,30 @@ export class CdpBridge implements BrowserSession {
 
   // ---- 内部ヘルパー -------------------------------------------------------
 
+  /**
+   * 操作中に CDP 接続が切れた場合(SSO リダイレクトでタブが再生成される等)、
+   * 一度だけ再接続してから操作をやり直す。二度目も切断されたら諦めて送出する。
+   * 接続断以外のエラーはそのまま送出する(症状を握り潰さない)。
+   */
+  private async withReconnect<T>(op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (e) {
+      if (!isConnectionClosed(e)) {
+        throw e;
+      }
+      log.warn("CDP: 接続が切れたため再接続して再試行します");
+      this.client = undefined;
+      await this.ensureReady();
+      return await op();
+    }
+  }
+
   private async evaluate<T>(expression: string): Promise<T> {
+    // 切断で client が失われていれば再接続する(未定義参照ではなく接続断として扱う)。
+    if (!this.client) {
+      await this.ensureReady();
+    }
     const res = await this.client.Runtime.evaluate({
       expression,
       returnByValue: true,
@@ -287,6 +320,9 @@ export class CdpBridge implements BrowserSession {
   }
 
   private async reload(): Promise<void> {
+    if (!this.client) {
+      await this.ensureReady();
+    }
     await this.client.Page.reload({ ignoreCache: false });
     await this.waitForLoad();
     await delay(1200);
@@ -303,14 +339,23 @@ export class CdpBridge implements BrowserSession {
   }
 
   private waitForLoad(timeoutMs = 30000): Promise<void> {
+    const client = this.client;
     return new Promise<void>((resolve) => {
       let done = false;
       let unsubscribe: (() => void) | undefined;
+      let poll: ReturnType<typeof setInterval> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (done) {
           return;
         }
         done = true;
+        if (poll) {
+          clearInterval(poll);
+        }
+        if (timer) {
+          clearTimeout(timer);
+        }
         try {
           unsubscribe?.();
         } catch {
@@ -318,8 +363,15 @@ export class CdpBridge implements BrowserSession {
         }
         resolve();
       };
-      unsubscribe = this.client.Page.loadEventFired(finish);
-      setTimeout(finish, timeoutMs);
+      unsubscribe = client.Page.loadEventFired(finish);
+      // 接続断(タブ再生成)では loadEventFired が来ないため、client の張り替えを検知して
+      // 満了を待たず早期に抜ける。再接続は呼び出し側(withReconnect)に委ねる。
+      poll = setInterval(() => {
+        if (this.client !== client) {
+          finish();
+        }
+      }, 250);
+      timer = setTimeout(finish, timeoutMs);
     });
   }
 
@@ -412,6 +464,17 @@ async function waitForPageReady(port: number, expectedUrl: string, timeoutMs: nu
     await delay(250);
   }
   log.warn("CDP: Copilot ページの起動確認がタイムアウトしました(続行します)");
+}
+
+/**
+ * CDP の WebSocket が閉じている/対象が破棄されたことを示すエラーかどうか。
+ * 例: "WebSocket is not open: readyState 3 (CLOSED)" / "Target closed"。
+ */
+function isConnectionClosed(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e ?? "");
+  return /WebSocket is not open|readyState 3|Target.*closed|not connected|Session closed|Inspected target/i.test(
+    msg,
+  );
 }
 
 function safeHost(url: string): string | undefined {
