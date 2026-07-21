@@ -11,7 +11,12 @@
  */
 export const RUN_STREAM_SCRIPT = String.raw`(arg, push) => new Promise((resolve, reject) => {
   let ws;
+  // この接続は拡張側の発信。WS フックがこの URL をテンプレートとして記録しないよう印を付ける
+  // (記録するのはページ自身の実接続だけにする)。new WebSocket は同期的にフックを通るため、
+  // 直後に false へ戻せば安全に自分の接続だけ除外できる。
+  try { globalThis.__mscopilotSelfConnecting = true; } catch (e) {}
   try { ws = new WebSocket(arg.wsUrl); } catch (e) { reject(String(e)); return; }
+  finally { try { globalThis.__mscopilotSelfConnecting = false; } catch (e) {} }
   try { ws.binaryType = "arraybuffer"; } catch (e) {}
   // 中断(VSCode の Cancel)用にアクティブな WS をグローバルへ公開する。
   try { globalThis.__mscopilotWs = ws; } catch (e) {}

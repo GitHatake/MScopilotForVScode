@@ -137,15 +137,25 @@ export class SubstrateClient {
       }
       // writeAtCursor は差分なので末尾へ追記する。
       if (interp.appendText) {
-        lastText += interp.appendText;
-        params.onDelta(interp.appendText);
+        if (lastText === "" && isServiceFailureText(interp.appendText)) {
+          errorText = interp.appendText.trim();
+        } else {
+          lastText += interp.appendText;
+          params.onDelta(interp.appendText);
+        }
       }
       // messages[].text は累積スナップショットなので差分を取り出す。
       if (interp.fullText !== undefined) {
-        const delta = diff(lastText, interp.fullText);
-        if (delta) {
-          lastText = interp.fullText;
-          params.onDelta(delta);
+        if (lastText === "" && isServiceFailureText(interp.fullText)) {
+          // サーバが本文として返す既知の失敗(=実応答ではない)。応答として表示せず、
+          // エラー扱いにして上位のトークン再取得+実接続テンプレート採取による再試行へ回す。
+          errorText = interp.fullText.trim();
+        } else {
+          const delta = diff(lastText, interp.fullText);
+          if (delta) {
+            lastText = interp.fullText;
+            params.onDelta(delta);
+          }
         }
       }
     };
@@ -179,6 +189,18 @@ function diff(prev: string, next: string): string {
   }
   // 稀に本文が置き換わる場合。UI では前回分の後に続けて出す。
   return next;
+}
+
+/**
+ * サーバが「本文」として返す既知の一時的失敗メッセージ(実応答ではない)。
+ * 合成リクエスト(実接続テンプレート未採取時のフォールバック)が実テナントに合わず
+ * モデル起動が拒否された場合に観測される。応答として採用せずエラー扱いにする。
+ */
+const SERVICE_FAILURE_TEXTS = ["language model unavailable"];
+
+function isServiceFailureText(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  return SERVICE_FAILURE_TEXTS.some((p) => t === p || t.startsWith(p));
 }
 
 function redactToken(url: string): string {

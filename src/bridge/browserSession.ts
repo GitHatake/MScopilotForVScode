@@ -262,7 +262,8 @@ export function isTokenFresh(token: SubstrateToken): boolean {
  *     こちらの方が早く・確実に採取できる(=一発で動きやすい)。
  *
  * CDP の addScriptToEvaluateOnNewDocument / Playwright の addInitScript でページ読込前に仕込むこと。
- * 自分(拡張)が張る接続で上書きしないよう、WS URL はページ読込ごとに最初の 1 本だけ記録する。
+ * 記録するのは「ページ自身が張る実接続」だけ。拡張側が張る発信用 WebSocket は
+ * __mscopilotSelfConnecting フラグで除外する(自作 URL をテンプレートとして再利用しないため)。
  */
 export const WS_HOOK_SCRIPT = `(() => {
   try {
@@ -295,7 +296,15 @@ export const WS_HOOK_SCRIPT = `(() => {
     var WrapWS = function (url, protocols) {
       try {
         var u = String(url);
-        if (!globalThis.__mscopilotWsUrl && u.indexOf("/Chathub/") !== -1 && u.indexOf("access_token=") !== -1) {
+        // 拡張自身の発信接続(__mscopilotSelfConnecting)は記録しない。
+        // 記録すると、その後の発信が自作 URL をテンプレートとして再利用してしまい、
+        // 誤ったパラメータのまま自己増殖する(=実接続を捕まえられなくなる)。
+        if (
+          !globalThis.__mscopilotSelfConnecting &&
+          !globalThis.__mscopilotWsUrl &&
+          u.indexOf("/Chathub/") !== -1 &&
+          u.indexOf("access_token=") !== -1
+        ) {
           globalThis.__mscopilotWsUrl = u;
         }
       } catch (e) {}
