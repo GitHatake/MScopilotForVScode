@@ -39,8 +39,15 @@ export class PlaywrightBridge implements BrowserSession {
   }
 
   async ensureReady(): Promise<void> {
-    if (this.page) {
+    if (this.page && !this.page.isClosed()) {
       return;
+    }
+    // 前回のセッションが閉じている/壊れている場合は、永続プロファイルのロックを解放するため
+    // 一度コンテキストを畳んでから作り直す(開いたままでは同じプロファイルで再起動できない)。
+    if (this.context) {
+      await this.context.close().catch(() => undefined);
+      this.context = undefined;
+      this.page = undefined;
     }
     const chromium = loadChromium();
     const launchOpts: Record<string, unknown> = {
@@ -61,7 +68,20 @@ export class PlaywrightBridge implements BrowserSession {
       this.context = await chromium.launchPersistentContext(this.profileDir, launchOpts);
     }
 
+    // ユーザーがブラウザ/タブを閉じた・クラッシュした場合、死んだ参照を掴み続けない。
+    // クリアしておけば次の ensureReady がクリーンに作り直す。
+    this.context.on("close", () => {
+      this.context = undefined;
+      this.page = undefined;
+    });
+
     this.page = this.context.pages()[0] ?? (await this.context.newPage());
+    this.page.on("close", () => {
+      this.page = undefined;
+    });
+    this.page.on("crash", () => {
+      this.page = undefined;
+    });
 
     await this.page.exposeFunction("__mscopilotPush", (id: string, s: string) => {
       const handler = this.streams.get(id);
