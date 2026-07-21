@@ -28,7 +28,6 @@ import {
 export class PlaywrightBridge implements BrowserSession {
   private context: any | undefined;
   private page: any | undefined;
-  private wsTemplateReloadTried = false;
   private readonly streams = new Map<string, (frame: unknown) => void>();
   private readonly profileDir: string;
 
@@ -136,33 +135,10 @@ export class PlaywrightBridge implements BrowserSession {
 
   async harvestWsTemplate(): Promise<string | undefined> {
     await this.ensureReady();
-    let url = await this.readHarvestedUrl();
-    if (!url && !this.wsTemplateReloadTried) {
-      // 既に開いていたページの実チャット接続は「読込前フック」が無いと URL を採取できない。
-      // 一度だけ再読込して、ページ自身が張り直す実接続の URL を採取する。
-      this.wsTemplateReloadTried = true;
-      log.info("ws template 未捕捉のため再読込して実接続の採取を試みます");
-      try {
-        await this.page.reload({ waitUntil: "domcontentloaded" });
-      } catch {
-        /* ignore */
-      }
-      url = await this.pollHarvestedUrl(6000);
-    }
+    // 非ブロッキングで読むだけ。実接続 URL は force トークン再取得時の reload や signIn で採取される。
+    // ここで能動的に再読込すると発信が数十秒ブロックするため行わない。
+    const url = await this.readHarvestedUrl();
     return url || undefined;
-  }
-
-  /** 実接続 URL が採取されるまで制限時間内でポーリングする(再読込直後の立ち上がり待ち)。 */
-  private async pollHarvestedUrl(budgetMs: number): Promise<string> {
-    const deadline = Date.now() + budgetMs;
-    do {
-      const url = await this.readHarvestedUrl();
-      if (url) {
-        return url;
-      }
-      await delay(500);
-    } while (Date.now() < deadline);
-    return "";
   }
 
   async harvestBearer(): Promise<string | undefined> {

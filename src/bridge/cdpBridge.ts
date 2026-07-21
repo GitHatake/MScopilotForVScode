@@ -34,7 +34,6 @@ import {
  */
 export class CdpBridge implements BrowserSession {
   private client: any | undefined;
-  private wsTemplateReloadTried = false;
   private readonly workProfile: string;
 
   constructor(
@@ -127,30 +126,11 @@ export class CdpBridge implements BrowserSession {
 
   async harvestWsTemplate(): Promise<string | undefined> {
     await this.ensureReady();
-    let url = await this.readHarvestedUrl();
-    if (!url && !this.wsTemplateReloadTried) {
-      // ページの実チャット接続は「読込前フック」が無いと URL を採取できない。
-      // 拡張起動時に既に開いていた接続は捕まえられないため、一度だけ再読込して、
-      // ページ自身が張り直す実接続の URL を採取する(発信で実値をそのまま再現するため)。
-      this.wsTemplateReloadTried = true;
-      log.info("ws template 未捕捉のため再読込して実接続の採取を試みます");
-      await this.reload().catch(() => undefined);
-      url = await this.pollHarvestedUrl(6000);
-    }
+    // 非ブロッキングで読むだけ。実接続 URL は force トークン再取得時の reload や signIn で
+    // 採取される(そこで __mscopilotWsUrl が入る)。ここで能動的に再読込すると発信が数十秒
+    // ブロックしてしまうため行わない。
+    const url = await this.readHarvestedUrl();
     return url || undefined;
-  }
-
-  /** 実接続 URL が採取されるまで制限時間内でポーリングする(再読込直後の立ち上がり待ち)。 */
-  private async pollHarvestedUrl(budgetMs: number): Promise<string> {
-    const deadline = Date.now() + budgetMs;
-    do {
-      const url = await this.readHarvestedUrl();
-      if (url) {
-        return url;
-      }
-      await delay(500);
-    } while (Date.now() < deadline);
-    return "";
   }
 
   async harvestBearer(): Promise<string | undefined> {

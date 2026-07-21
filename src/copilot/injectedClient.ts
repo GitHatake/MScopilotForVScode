@@ -31,6 +31,8 @@ export const RUN_STREAM_SCRIPT = String.raw`(arg, push) => new Promise((resolve,
     if (ok) resolve(info || "done"); else reject(info || "ws error");
   };
   ws.onopen = () => {
+    // 接続確立を Node 側ログへ通知(「未接続」と「接続後サーバ無応答」を切り分けるため)。
+    push(JSON.stringify({ __transport: "open" }));
     try { ws.send(arg.handshake); } catch (e) { finish(false, String(e)); }
   };
   ws.onerror = () => { push(JSON.stringify({ __transport: "error" })); };
