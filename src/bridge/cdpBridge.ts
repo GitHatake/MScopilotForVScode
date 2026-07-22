@@ -9,18 +9,21 @@ import {
   BrowserSession,
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
+  HarvestedBearer,
   READ_BEARER_SCRIPT,
+  READ_BEARERS_SCRIPT,
   READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
   WS_HOOK_SCRIPT,
   formatInventory,
+  formatTokenScope,
   inventoryTokens,
   isTokenFresh,
   parseWsUrlToken,
+  pickBearerToken,
   pickSydneyToken,
-  tokenFromSecret,
 } from "./browserSession";
 
 /**
@@ -153,6 +156,20 @@ export class CdpBridge implements BrowserSession {
     return this.evaluate<string>(READ_BEARER_SCRIPT).catch(() => "");
   }
 
+  /** 採取済みの substrate 宛 Bearer 群(URL付き)を読む。選別は pickBearerToken で行う。 */
+  private async readHarvestedBearers(): Promise<HarvestedBearer[]> {
+    if (!this.client) {
+      return [];
+    }
+    const json = await this.evaluate<string>(READ_BEARERS_SCRIPT).catch(() => "[]");
+    try {
+      const list = JSON.parse(json || "[]");
+      return Array.isArray(list) ? (list as HarvestedBearer[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
   /**
    * トークン取得の本体。実テナントでは access_token が web ストレージに残らないため、
    * 「再読込 → 一定時間ポーリング」を繰り返しつつ 3 経路を試す。
@@ -188,7 +205,7 @@ export class CdpBridge implements BrowserSession {
         logAcquired("storage", storage);
         return storage;
       }
-      const bearer = tokenFromSecret(await this.readHarvestedBearer());
+      const bearer = pickBearerToken(await this.readHarvestedBearers());
       if (bearer && isTokenFresh(bearer)) {
         logAcquired("http-bearer", bearer);
         return bearer;
@@ -520,7 +537,7 @@ function findBrowser(): string | undefined {
 function logAcquired(via: string, token: SubstrateToken): void {
   log.info(
     `token acquired (${via}): oid=${token.objectId.slice(0, 8)}… tid=${token.tenantId.slice(0, 8)}… ` +
-      `exp=${new Date(token.expiresAt).toISOString()}`,
+      `exp=${new Date(token.expiresAt).toISOString()} ${formatTokenScope(token)}`,
   );
 }
 

@@ -3,6 +3,8 @@
 import assert from "node:assert";
 import {
   pickSydneyToken,
+  pickBearerToken,
+  formatTokenScope,
   inventoryTokens,
   parseWsUrlToken,
   tokenFromSecret,
@@ -11,6 +13,7 @@ import {
   RawTokenCandidate,
 } from "../bridge/browserSession";
 import { RUN_STREAM_SCRIPT } from "../copilot/injectedClient";
+import { ResponseAssembler } from "../copilot/responseAssembler";
 import {
   buildWsUrl,
   buildInvocation,
@@ -141,6 +144,93 @@ ok("COLLECT_TOKENS_SCRIPT は local/sessionStorage を走査し候補(メタ付�
   assert.equal(c.store, "sessionStorage");
   void s2;
   delete (globalThis as any).window;
+});
+
+console.log("Bearer 選別(スコープ別):");
+ok("複数 substrate Bearer から Copilot(Chathub)用を URL で選ぶ", () => {
+  // substrate は同一ホストで多数サービスを提供。URL とスコープで Copilot 用を見分ける。
+  const copilot = jwt({ aud: "https://substrate.office.com", oid: "o", tid: "t", exp: FUTURE });
+  const optics = jwt({ aud: "https://substrate.office.com", oid: "o", tid: "t", exp: FUTURE });
+  const picked = pickBearerToken([
+    { t: optics, u: "https://substrate.office.com/optics/v2/upload" },
+    { t: copilot, u: "https://substrate.office.com/m365Copilot/conversations" },
+  ]);
+  assert.ok(picked, "選ばれること");
+  assert.equal(picked!.accessToken, copilot, "m365Copilot URL のトークンを優先(score3)");
+});
+ok("scp が sydney の Bearer を URL 非Copilotでも拾う", () => {
+  const secret = jwt({ aud: "api://guid", scp: "M365Chat.ReadWrite", oid: "o", tid: "t", exp: FUTURE });
+  const picked = pickBearerToken([{ t: secret, u: "https://substrate.office.com/search" }]);
+  assert.ok(picked);
+  assert.equal(picked!.accessToken, secret);
+});
+ok("文字列だけの Bearer リストも受け付ける(後方互換)", () => {
+  const secret = jwt({ aud: "https://substrate.office.com/sydney", oid: "o", tid: "t", exp: FUTURE });
+  assert.equal(pickBearerToken([secret])!.accessToken, secret);
+});
+ok("空/不正な Bearer リストは undefined", () => {
+  assert.equal(pickBearerToken([]), undefined);
+  assert.equal(pickBearerToken([{ t: "", u: "x" }]), undefined);
+});
+ok("formatTokenScope は aud/scp/score を出す(secret は含めない)", () => {
+  const secret = jwt({ aud: "https://substrate.office.com/sydney", scp: "Chat.RW", oid: "o", tid: "t", exp: FUTURE });
+  const s = formatTokenScope({ accessToken: secret, objectId: "o", tenantId: "t", expiresAt: FUTURE * 1000 });
+  assert.ok(s.includes("aud=https://substrate.office.com/sydney"));
+  assert.ok(s.includes("scp=Chat.RW"));
+  assert.ok(s.includes("score=3"));
+  assert.ok(!s.includes(secret), "secret を漏らさない");
+});
+
+console.log("応答組み立て / 失敗検出:");
+ok("スナップショット差分を正しく onDelta へ流す", () => {
+  const out: string[] = [];
+  const a = new ResponseAssembler((d) => out.push(d));
+  a.setSnapshot("Hello");
+  a.setSnapshot("Hello world");
+  a.end();
+  assert.equal(out.join(""), "Hello world");
+  assert.equal(a.text, "Hello world");
+  assert.equal(a.produced, true);
+  assert.equal(a.failure, undefined);
+});
+ok("writeAtCursor 差分を追記できる", () => {
+  const out: string[] = [];
+  const a = new ResponseAssembler((d) => out.push(d));
+  a.setSnapshot("Hello! How can");
+  a.appendDelta(" I help you today");
+  a.appendDelta("?");
+  a.end();
+  assert.equal(out.join(""), "Hello! How can I help you today?");
+});
+ok("分割到着した失敗フレーズを本文に出さず error 化する(feedback_4 の症状)", () => {
+  const out: string[] = [];
+  const a = new ResponseAssembler((d) => out.push(d));
+  a.appendDelta("Language model");
+  a.appendDelta(" unavailable");
+  a.end();
+  assert.equal(out.length, 0, "本文は一切出さない");
+  assert.equal(a.produced, false, "produced=false でリトライ対象");
+  assert.equal(a.failure, "Language model unavailable");
+  assert.equal(a.text, "", "失敗は応答本文にしない");
+});
+ok("一括到着の失敗フレーズも error 化する", () => {
+  const out: string[] = [];
+  const a = new ResponseAssembler((d) => out.push(d));
+  a.setSnapshot("Language model unavailable");
+  a.end();
+  assert.equal(out.length, 0);
+  assert.equal(a.failure, "Language model unavailable");
+});
+ok("失敗フレーズと同じ書き出しでも本物の応答は出す", () => {
+  const out: string[] = [];
+  const a = new ResponseAssembler((d) => out.push(d));
+  // 失敗フレーズの前方一致で一旦保留 → 分岐した時点でフラッシュ。
+  a.appendDelta("Language model");
+  a.appendDelta("s are neural networks.");
+  a.end();
+  assert.equal(a.failure, undefined);
+  assert.equal(out.join(""), "Language models are neural networks.");
+  assert.equal(a.produced, true);
 });
 
 console.log("WebSocket URL:");

@@ -6,18 +6,21 @@ import {
   BrowserSession,
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
+  HarvestedBearer,
   READ_BEARER_SCRIPT,
+  READ_BEARERS_SCRIPT,
   READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
   WS_HOOK_SCRIPT,
   formatInventory,
+  formatTokenScope,
   inventoryTokens,
   isTokenFresh,
   parseWsUrlToken,
+  pickBearerToken,
   pickSydneyToken,
-  tokenFromSecret,
 } from "./browserSession";
 
 /**
@@ -163,6 +166,20 @@ export class PlaywrightBridge implements BrowserSession {
     }
   }
 
+  /** 採取済みの substrate 宛 Bearer 群(URL付き)を読む。選別は pickBearerToken で行う。 */
+  private async readHarvestedBearers(): Promise<HarvestedBearer[]> {
+    try {
+      if (!this.page) {
+        return [];
+      }
+      const json = String((await this.page.evaluate(READ_BEARERS_SCRIPT)) || "[]");
+      const list = JSON.parse(json);
+      return Array.isArray(list) ? (list as HarvestedBearer[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
   /** 実テナントでは access_token が永続化されないため、3 経路を制限時間内で走査する。 */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
     const attempts = 4;
@@ -175,17 +192,23 @@ export class PlaywrightBridge implements BrowserSession {
       do {
         const storage = pickSydneyToken(await this.collectRawTokens());
         if (storage && isTokenFresh(storage)) {
-          log.info(`token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()}`);
+          log.info(
+            `token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()} ${formatTokenScope(storage)}`,
+          );
           return storage;
         }
-        const bearer = tokenFromSecret(await this.readHarvestedBearer());
+        const bearer = pickBearerToken(await this.readHarvestedBearers());
         if (bearer && isTokenFresh(bearer)) {
-          log.info(`token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()}`);
+          log.info(
+            `token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()} ${formatTokenScope(bearer)}`,
+          );
           return bearer;
         }
         const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
         if (wsToken && isTokenFresh(wsToken)) {
-          log.info(`token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()}`);
+          log.info(
+            `token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()} ${formatTokenScope(wsToken)}`,
+          );
           return wsToken;
         }
         await delay(750);

@@ -270,11 +270,22 @@ export const WS_HOOK_SCRIPT = `(() => {
     if (window.__mscopilotHooked) return;
     window.__mscopilotHooked = true;
     var SUB = /substrate\\.(office\\.com|svc\\.cloud\\.microsoft)/i;
-    var captureBearer = function (auth) {
+    var captureBearer = function (auth, url) {
       try {
         if (!auth) return;
         var m = /Bearer\\s+([A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+)/i.exec(String(auth));
-        if (m) globalThis.__mscopilotBearer = m[1];
+        if (!m) return;
+        var tok = m[1];
+        // 後方互換: 最後に観測した substrate Bearer。
+        globalThis.__mscopilotBearer = tok;
+        // substrate は多数のサービスを同一ホストで提供し、サービスごとにスコープの異なる
+        // トークンが飛ぶ。どれが Copilot(Chathub)用か Node 側で選別できるよう、リクエスト
+        // URL と対にして全件ためる(重複はURLだけ更新)。
+        var list = globalThis.__mscopilotBearers || (globalThis.__mscopilotBearers = []);
+        for (var i = 0; i < list.length; i++) {
+          if (list[i].t === tok) { list[i].u = String(url || list[i].u || ""); return; }
+        }
+        if (list.length < 30) list.push({ t: tok, u: String(url || "") });
       } catch (e) {}
     };
     var headerGet = function (h, name) {
@@ -326,7 +337,7 @@ export const WS_HOOK_SCRIPT = `(() => {
             if (!auth && input && input.headers && typeof input.headers.get === "function") {
               auth = input.headers.get("authorization") || "";
             }
-            captureBearer(auth);
+            captureBearer(auth, url);
           }
         } catch (e) {}
         return of.apply(this, arguments);
@@ -342,7 +353,7 @@ export const WS_HOOK_SCRIPT = `(() => {
     };
     XP.setRequestHeader = function (key, value) {
       try {
-        if (String(key).toLowerCase() === "authorization" && SUB.test(this.__mscUrl || "")) captureBearer(value);
+        if (String(key).toLowerCase() === "authorization" && SUB.test(this.__mscUrl || "")) captureBearer(value, this.__mscUrl);
       } catch (e) {}
       return oSet.apply(this, arguments);
     };
@@ -354,6 +365,48 @@ export const READ_WS_URL_SCRIPT = `(globalThis.__mscopilotWsUrl || "")`;
 
 /** 捕捉済みの substrate 宛 Bearer トークン(JWT 本体)を返すスクリプト式(無ければ空文字)。 */
 export const READ_BEARER_SCRIPT = `(globalThis.__mscopilotBearer || "")`;
+
+/**
+ * 捕捉済みの substrate 宛 Bearer 群(URL付き)を JSON 文字列で返すスクリプト式。
+ * サービスごとにスコープが異なるため、Node 側で Copilot(Chathub)用を選別する。
+ */
+export const READ_BEARERS_SCRIPT = `JSON.stringify(globalThis.__mscopilotBearers || [])`;
+
+/** ページから採取した Bearer 1 件(t=JWT本体, u=リクエストURL)。 */
+export interface HarvestedBearer {
+  t: string;
+  u: string;
+}
+
+/**
+ * ページの substrate 宛 HTTP から採取した Bearer 群から、Copilot(Chathub)用として
+ * 最良のトークンを 1 つ選ぶ。substrate は同一ホストで多数のサービスを提供し、サービスごとに
+ * スコープの異なるトークンが飛ぶ。誤ったスコープのトークンでも WebSocket 認証は通るが、
+ * モデル起動が拒否され本文に "Language model unavailable" が返るため、スコープ選別が要。
+ *
+ * 各 Bearer をリクエスト URL を target とした候補に変換し、既存の pickSydneyToken に委譲する
+ * (URL の chathub/m365copilot 等 + JWT の aud/scp でスコアリングし、chat 用 > substrate 一般)。
+ */
+export function pickBearerToken(bearers: Array<HarvestedBearer | string>): SubstrateToken | undefined {
+  const candidates: RawTokenCandidate[] = [];
+  for (const b of bearers) {
+    if (typeof b === "string") {
+      if (b) candidates.push({ secret: b });
+    } else if (b && typeof b.t === "string" && b.t) {
+      candidates.push({ secret: b.t, target: typeof b.u === "string" ? b.u : "" });
+    }
+  }
+  return pickSydneyToken(candidates);
+}
+
+/** トークンの素性(aud / scp / 選別スコア)を診断ログ用に整形する。secret は含めない。 */
+export function formatTokenScope(token: SubstrateToken): string {
+  const payload = decodeJwt(token.accessToken);
+  const aud = payload?.aud || "?";
+  const scp = (payload?.scp || "").slice(0, 80);
+  const score = scoreText(matchText({ secret: token.accessToken }, payload));
+  return `aud=${aud} scp=${scp} score=${score}`;
+}
 
 /**
  * JWT 本体(secret)から SubstrateToken を組み立てる。oid/tid が読めない JWT は対象外。

@@ -3,6 +3,7 @@ import type { BrowserSession } from "../bridge/browserSession";
 import type { MsCopilotConfig } from "../config";
 import { log } from "../logger";
 import { RUN_STREAM_SCRIPT } from "./injectedClient";
+import { ResponseAssembler } from "./responseAssembler";
 import {
   RECORD_SEP,
   buildInvocation,
@@ -86,7 +87,7 @@ export class SubstrateClient {
     );
     log.info(`ws endpoint: ${redactToken(endpoint.url)}`);
 
-    let lastText = "";
+    const assembler = new ResponseAssembler(params.onDelta);
     let resolvedConversationId = conversationId;
     let errorText: string | undefined;
 
@@ -109,12 +110,12 @@ export class SubstrateClient {
           meta.__transport === "closed" &&
           meta.code !== undefined &&
           meta.code !== 1000 &&
-          lastText === "" &&
+          !assembler.produced &&
           !errorText
         ) {
           errorText = `WebSocket が異常終了しました (code ${meta.code}${meta.reason ? `: ${meta.reason}` : ""})`;
         }
-        if (meta.__transport === "error" && lastText === "" && !errorText) {
+        if (meta.__transport === "error" && !assembler.produced && !errorText) {
           errorText = "WebSocket 接続エラー(CSP/ネットワーク/認証を確認してください)";
         }
         return;
@@ -137,26 +138,14 @@ export class SubstrateClient {
       }
       // writeAtCursor は差分なので末尾へ追記する。
       if (interp.appendText) {
-        if (lastText === "" && isServiceFailureText(interp.appendText)) {
-          errorText = interp.appendText.trim();
-        } else {
-          lastText += interp.appendText;
-          params.onDelta(interp.appendText);
-        }
+        assembler.appendDelta(interp.appendText);
       }
       // messages[].text は累積スナップショットなので差分を取り出す。
       if (interp.fullText !== undefined) {
-        if (lastText === "" && isServiceFailureText(interp.fullText)) {
-          // サーバが本文として返す既知の失敗(=実応答ではない)。応答として表示せず、
-          // エラー扱いにして上位のトークン再取得+実接続テンプレート採取による再試行へ回す。
-          errorText = interp.fullText.trim();
-        } else {
-          const delta = diff(lastText, interp.fullText);
-          if (delta) {
-            lastText = interp.fullText;
-            params.onDelta(delta);
-          }
-        }
+        assembler.setSnapshot(interp.fullText);
+      }
+      if (interp.done) {
+        assembler.end();
       }
     };
 
@@ -175,32 +164,18 @@ export class SubstrateClient {
       }
     }
 
-    return { text: lastText, conversationId: resolvedConversationId, error: errorText };
+    // ストリーム終了。保留中の本文があれば最終判定(失敗フレーズなら error 化)して確定する。
+    assembler.end();
+    if (assembler.failure) {
+      log.warn(`service failure: ${assembler.failure}`);
+    }
+
+    return {
+      text: assembler.text,
+      conversationId: resolvedConversationId,
+      error: errorText ?? assembler.failure,
+    };
   }
-}
-
-/**
- * スナップショット方式(累積本文が毎回届く)を前提に差分を計算する。
- * prev が next の接頭辞なら末尾差分、そうでなければ next 全体を新規本文として返す。
- */
-function diff(prev: string, next: string): string {
-  if (next.startsWith(prev)) {
-    return next.slice(prev.length);
-  }
-  // 稀に本文が置き換わる場合。UI では前回分の後に続けて出す。
-  return next;
-}
-
-/**
- * サーバが「本文」として返す既知の一時的失敗メッセージ(実応答ではない)。
- * 合成リクエスト(実接続テンプレート未採取時のフォールバック)が実テナントに合わず
- * モデル起動が拒否された場合に観測される。応答として採用せずエラー扱いにする。
- */
-const SERVICE_FAILURE_TEXTS = ["language model unavailable"];
-
-function isServiceFailureText(text: string): boolean {
-  const t = text.trim().toLowerCase();
-  return SERVICE_FAILURE_TEXTS.some((p) => t === p || t.startsWith(p));
 }
 
 function redactToken(url: string): string {
