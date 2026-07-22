@@ -12,11 +12,13 @@ import {
   HarvestedBearer,
   READ_BEARER_SCRIPT,
   READ_BEARERS_SCRIPT,
+  READ_NET_SCRIPT,
   READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
   WS_HOOK_SCRIPT,
+  describeBearers,
   formatInventory,
   formatTokenScope,
   inventoryTokens,
@@ -183,17 +185,54 @@ export class CdpBridge implements BrowserSession {
     const attempts = 4;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
+        log.info(`token: attempt ${attempt + 1}/${attempts} — ページを再読込します (force=${force})`);
         await this.reload();
       }
       // 読込直後は substrate への実トラフィックが立ち上がるまで間がある。
       // 初回は短め、再読込後はページ全体が動くまで長めに待つ。
       const budgetMs = attempt === 0 && !force ? 4000 : 12000;
       const token = await this.pollTokenSources(budgetMs);
+      // 採取状況を毎回スナップショット(Copilot 用トークンが採れているか解析できるように)。
+      await this.logHarvestSnapshot(`attempt ${attempt + 1}${token ? " ✓" : ""}`);
       if (token) {
         return token;
       }
     }
     return undefined;
+  }
+
+  /**
+   * 採取状況を診断ログへ大量に出す。どの経路で・どのスコープのトークンが採れているか、
+   * ページがどんな substrate/認証通信・WebSocket を張ったかを可視化する。
+   */
+  private async logHarvestSnapshot(tag: string): Promise<void> {
+    try {
+      const bearers = await this.readHarvestedBearers();
+      const wsUrl = await this.readHarvestedUrl();
+      const storage = (await this.collectRawTokens()).length;
+      log.info(`── harvest snapshot [${tag}] ──`);
+      log.info(`  MSAL storage 候補: ${storage} 件 / 実接続WS: ${wsUrl ? "捕捉済み" : "未捕捉"}`);
+      log.info(`  Bearer 候補 ${bearers.length} 件(★=Copilot想定 score3 / ○=substrate score2):\n${describeBearers(bearers)}`);
+      const net = await this.readNetTrace();
+      if (net.length) {
+        log.info(`  ネットワークトレース ${net.length} 件:\n${net.map((s) => "    " + s).join("\n")}`);
+      }
+    } catch (e) {
+      log.warn("harvest snapshot 失敗", e as Error);
+    }
+  }
+
+  private async readNetTrace(): Promise<string[]> {
+    if (!this.client) {
+      return [];
+    }
+    const json = await this.evaluate<string>(READ_NET_SCRIPT).catch(() => "[]");
+    try {
+      const arr = JSON.parse(json || "[]");
+      return Array.isArray(arr) ? (arr as string[]) : [];
+    } catch {
+      return [];
+    }
   }
 
   /** 制限時間内で 3 経路を繰り返し走査し、最初に得られた有効トークンを返す。 */
@@ -225,7 +264,9 @@ export class CdpBridge implements BrowserSession {
       const href = await this.currentUrl();
       const inv = inventoryTokens(await this.collectRawTokens());
       log.warn(`token 取得失敗。現在のページ: ${href || "(不明)"}`);
-      log.warn(`検出したトークン候補 ${inv.length} 件:\n${formatInventory(inv)}`);
+      log.warn(`MSAL 候補 ${inv.length} 件:\n${formatInventory(inv)}`);
+      const bearers = await this.readHarvestedBearers();
+      log.warn(`HTTP/WS Bearer 候補 ${bearers.length} 件:\n${describeBearers(bearers)}`);
     } catch (e) {
       log.warn("token inventory の収集に失敗", e as Error);
     }

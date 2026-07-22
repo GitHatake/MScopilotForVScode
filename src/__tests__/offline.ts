@@ -4,6 +4,7 @@ import assert from "node:assert";
 import {
   pickSydneyToken,
   pickBearerToken,
+  describeBearers,
   formatTokenScope,
   inventoryTokens,
   parseWsUrlToken,
@@ -179,6 +180,22 @@ ok("formatTokenScope は aud/scp/score を出す(secret は含めない)", () =>
   assert.ok(s.includes("scp=Chat.RW"));
   assert.ok(s.includes("score=3"));
   assert.ok(!s.includes(secret), "secret を漏らさない");
+});
+ok("describeBearers は score 降順で整形し secret を漏らさない(feedback_5 の可視化)", () => {
+  const search = jwt({ aud: "https://substrate.office.com/search", scp: "SubstrateSearch-Internal.ReadWrite", oid: "o", tid: "t", exp: FUTURE });
+  const copilot = jwt({ aud: "https://substrate.office.com", oid: "o", tid: "t", exp: FUTURE });
+  const out = describeBearers([
+    { t: search, u: "https://substrate.office.com/search/api", via: "req-header" },
+    { t: copilot, u: "https://substrate.office.com/m365Copilot/conversations", via: "ws-url" },
+  ]);
+  // score3(★, Copilot)が先頭、score2(○, search)が後。
+  assert.ok(out.indexOf("★") < out.indexOf("○"), "score 降順(Copilot が先)");
+  assert.ok(out.includes("via=ws-url"), "採取経路を出す");
+  assert.ok(out.includes("scp=SubstrateSearch-Internal.ReadWrite"), "scp を出す");
+  assert.ok(!out.includes(search) && !out.includes(copilot), "secret を漏らさない");
+});
+ok("describeBearers は候補ゼロでも安全なメッセージを返す", () => {
+  assert.ok(describeBearers([]).includes("1 件も採取していません"));
 });
 
 console.log("応答組み立て / 失敗検出:");

@@ -252,40 +252,75 @@ export function isTokenFresh(token: SubstrateToken): boolean {
 }
 
 /**
- * ページ内で実行し、実テナントの substrate トークンを 2 経路で採取するフック。
- * 実テナントでは access_token が web ストレージに永続化されないことがあるため、
- * MSAL 走査の代わりにページの実トラフィックから拾う。
+ * ページ内で実行し、実テナントの substrate トークンを複数経路で採取するフック。
+ * 実テナントでは access_token が web ストレージに永続化されないため、ページの実トラフィックから拾う。
  *
  *  1) window.WebSocket: substrate 実接続 URL(access_token 付き)を __mscopilotWsUrl に記録。
- *  2) fetch / XMLHttpRequest: substrate 宛リクエストの Authorization: Bearer を __mscopilotBearer に記録。
- *     チャット WebSocket が開くのを待たずとも、ページは読込時に substrate へ HTTP を投げるため、
- *     こちらの方が早く・確実に採取できる(=一発で動きやすい)。
+ *  2) fetch / XMLHttpRequest の **リクエスト** Authorization: Bearer を採取(__mscopilotBearers)。
+ *  3) fetch / XMLHttpRequest の **レスポンス本文** に含まれる JWT を採取(__mscopilotBearers)。
+ *     実測(feedback_5)で、HTTP ヘッダに乗る substrate トークンは /search 用のみで、Copilot
+ *     (Chathub)用トークンは WebSocket URL のクエリにしか現れないと判明した。Copilot 用トークンは
+ *     MSAL のトークン取得(login.microsoftonline 等への通信)の**レスポンス本文**を経由するため、
+ *     WebSocket が開く前でも本文走査で拾える可能性がある。スコープ選別は Node 側(pickBearerToken)。
+ *
+ * さらに、解析用に substrate/認証系の通信と WebSocket を __mscopilotNet に**大量にトレース**する。
  *
  * CDP の addScriptToEvaluateOnNewDocument / Playwright の addInitScript でページ読込前に仕込むこと。
- * 記録するのは「ページ自身が張る実接続」だけ。拡張側が張る発信用 WebSocket は
- * __mscopilotSelfConnecting フラグで除外する(自作 URL をテンプレートとして再利用しないため)。
+ * 拡張側が張る発信用 WebSocket は __mscopilotSelfConnecting フラグで除外する。
  */
 export const WS_HOOK_SCRIPT = `(() => {
   try {
     if (window.__mscopilotHooked) return;
     window.__mscopilotHooked = true;
     var SUB = /substrate\\.(office\\.com|svc\\.cloud\\.microsoft)/i;
-    var captureBearer = function (auth, url) {
+    // トレース対象(広め): substrate/認証系/Copilot 関連の通信を可視化する。
+    var TOKENISH = /(login\\.microsoftonline|login\\.windows\\.net|\\/oauth2\\/|\\/token|substrate\\.(office\\.com|svc\\.cloud\\.microsoft)|copilot|sydney|m365chat|authgateway|\\.auth\\.|getaccesstoken|issuetoken)/i;
+    // レスポンス本文を走査する対象(狭め): トークン発行系のみ。substrate の一般 API 本文は
+    // 走査しない(巨大かつ Copilot トークンを含まないため)。Copilot 用トークンは MSAL の
+    // トークン取得(oauth2/token 等)の本文を経由しうる。
+    var AUTHISH = /(login\\.microsoftonline|login\\.windows\\.net|\\/oauth2\\/|\\/common\\/|issuetoken|getaccesstoken|authgateway|\\.auth\\.|\\/token)/i;
+    var JWT_RE = /eyJ[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+\\.[A-Za-z0-9_\\-]+/g;
+
+    // --- 解析用ネットワークトレース(トークンは載せない) ---
+    var trace = function (s) {
       try {
-        if (!auth) return;
-        var m = /Bearer\\s+([A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+)/i.exec(String(auth));
-        if (!m) return;
-        var tok = m[1];
-        // 後方互換: 最後に観測した substrate Bearer。
-        globalThis.__mscopilotBearer = tok;
-        // substrate は多数のサービスを同一ホストで提供し、サービスごとにスコープの異なる
-        // トークンが飛ぶ。どれが Copilot(Chathub)用か Node 側で選別できるよう、リクエスト
-        // URL と対にして全件ためる(重複はURLだけ更新)。
+        var a = globalThis.__mscopilotNet || (globalThis.__mscopilotNet = []);
+        if (a.length < 400) a.push(String((Date.now() % 100000) + " " + s));
+      } catch (e) {}
+    };
+    var shortUrl = function (u) {
+      try { var s = String(u).split("?")[0]; return s.length > 140 ? s.slice(0, 140) + "…" : s; } catch (e) { return ""; }
+    };
+
+    // --- Bearer 蓄積(request header / response body 共通) ---
+    var addBearer = function (tok, url, via) {
+      try {
+        if (!tok || String(tok).indexOf("eyJ") !== 0) return;
+        globalThis.__mscopilotBearer = tok; // 後方互換: 最後に観測した Bearer
         var list = globalThis.__mscopilotBearers || (globalThis.__mscopilotBearers = []);
         for (var i = 0; i < list.length; i++) {
           if (list[i].t === tok) { list[i].u = String(url || list[i].u || ""); return; }
         }
-        if (list.length < 30) list.push({ t: tok, u: String(url || "") });
+        if (list.length < 60) {
+          list.push({ t: tok, u: String(url || ""), via: String(via || "") });
+          trace("TOKEN+ via=" + (via || "") + " " + shortUrl(url));
+        }
+      } catch (e) {}
+    };
+    var captureAuthHeader = function (auth, url) {
+      try {
+        if (!auth) return;
+        var m = /Bearer\\s+(eyJ[A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+\\.[A-Za-z0-9\\-_.]+)/i.exec(String(auth));
+        if (m) addBearer(m[1], url, "req-header");
+      } catch (e) {}
+    };
+    var scanBody = function (text, url) {
+      try {
+        if (!text || typeof text !== "string" || text.length > 3000000) return;
+        if (text.indexOf("eyJ") === -1) return;
+        var m, n = 0;
+        JWT_RE.lastIndex = 0;
+        while ((m = JWT_RE.exec(text)) !== null && n < 12) { addBearer(m[0], url, "resp-body"); n++; }
       } catch (e) {}
     };
     var headerGet = function (h, name) {
@@ -307,16 +342,18 @@ export const WS_HOOK_SCRIPT = `(() => {
     var WrapWS = function (url, protocols) {
       try {
         var u = String(url);
-        // 拡張自身の発信接続(__mscopilotSelfConnecting)は記録しない。
-        // 記録すると、その後の発信が自作 URL をテンプレートとして再利用してしまい、
-        // 誤ったパラメータのまま自己増殖する(=実接続を捕まえられなくなる)。
-        if (
-          !globalThis.__mscopilotSelfConnecting &&
-          !globalThis.__mscopilotWsUrl &&
-          u.indexOf("/Chathub/") !== -1 &&
-          u.indexOf("access_token=") !== -1
-        ) {
-          globalThis.__mscopilotWsUrl = u;
+        var self = !!globalThis.__mscopilotSelfConnecting;
+        trace("WS" + (self ? "(self)" : "") + " " + shortUrl(u));
+        // 拡張自身の発信接続(__mscopilotSelfConnecting)は記録しない(自作URLの再利用を防ぐ)。
+        if (!self && u.indexOf("/Chathub/") !== -1 && u.indexOf("access_token=") !== -1) {
+          if (!globalThis.__mscopilotWsUrl) globalThis.__mscopilotWsUrl = u;
+          var wl = globalThis.__mscopilotWsUrls || (globalThis.__mscopilotWsUrls = []);
+          if (wl.indexOf(u) === -1 && wl.length < 10) wl.push(u);
+          // WS URL のクエリから Copilot 用 access_token も Bearer 候補として拾う。
+          try {
+            var mm = /[?&]access_token=([^&]+)/.exec(u);
+            if (mm) addBearer(decodeURIComponent(mm[1]), u, "ws-url");
+          } catch (e2) {}
         }
       } catch (e) {}
       return protocols !== undefined ? new OW(url, protocols) : new OW(url);
@@ -326,34 +363,64 @@ export const WS_HOOK_SCRIPT = `(() => {
     WrapWS.CLOSING = OW.CLOSING; WrapWS.CLOSED = OW.CLOSED;
     window.WebSocket = WrapWS;
 
-    // 2) fetch
+    // 2) fetch(request header + response body)
     var of = window.fetch;
     if (typeof of === "function") {
       window.fetch = function (input, init) {
+        var url = "";
         try {
-          var url = typeof input === "string" ? input : (input && input.url) || "";
+          url = typeof input === "string" ? input : (input && input.url) || "";
           if (SUB.test(url)) {
             var auth = init && init.headers ? headerGet(init.headers, "authorization") : "";
             if (!auth && input && input.headers && typeof input.headers.get === "function") {
               auth = input.headers.get("authorization") || "";
             }
-            captureBearer(auth, url);
+            captureAuthHeader(auth, url);
+          }
+          if (TOKENISH.test(url)) trace("FETCH " + shortUrl(url));
+        } catch (e) {}
+        var res = of.apply(this, arguments);
+        try {
+          if (url && AUTHISH.test(url) && res && typeof res.then === "function") {
+            res.then(function (resp) {
+              try {
+                trace("FETCH<- " + (resp && resp.status) + " " + shortUrl(url));
+                if (resp && typeof resp.clone === "function") {
+                  resp.clone().text().then(function (t) { scanBody(t, url); }, function () {});
+                }
+              } catch (e) {}
+            }, function () {});
           }
         } catch (e) {}
-        return of.apply(this, arguments);
+        return res;
       };
     }
 
-    // 3) XMLHttpRequest
+    // 3) XMLHttpRequest(request header + response body)
     var XP = XMLHttpRequest.prototype;
     var oOpen = XP.open, oSet = XP.setRequestHeader;
     XP.open = function (method, url) {
-      try { this.__mscUrl = String(url || ""); } catch (e) {}
+      try {
+        this.__mscUrl = String(url || "");
+        if (TOKENISH.test(this.__mscUrl)) {
+          trace("XHR " + shortUrl(this.__mscUrl));
+          var self = this;
+          var scan = AUTHISH.test(this.__mscUrl);
+          this.addEventListener("load", function () {
+            try {
+              trace("XHR<- " + self.status + " " + shortUrl(self.__mscUrl));
+              if (!scan) return;
+              var rt = (self.responseType === "" || self.responseType === "text") ? self.responseText : "";
+              if (rt) scanBody(rt, self.__mscUrl);
+            } catch (e) {}
+          });
+        }
+      } catch (e) {}
       return oOpen.apply(this, arguments);
     };
     XP.setRequestHeader = function (key, value) {
       try {
-        if (String(key).toLowerCase() === "authorization" && SUB.test(this.__mscUrl || "")) captureBearer(value, this.__mscUrl);
+        if (String(key).toLowerCase() === "authorization" && SUB.test(this.__mscUrl || "")) captureAuthHeader(value, this.__mscUrl);
       } catch (e) {}
       return oSet.apply(this, arguments);
     };
@@ -366,16 +433,60 @@ export const READ_WS_URL_SCRIPT = `(globalThis.__mscopilotWsUrl || "")`;
 /** 捕捉済みの substrate 宛 Bearer トークン(JWT 本体)を返すスクリプト式(無ければ空文字)。 */
 export const READ_BEARER_SCRIPT = `(globalThis.__mscopilotBearer || "")`;
 
+/** 解析用ネットワークトレースを取り出して消費する(読むたびにクリア)スクリプト式。 */
+export const READ_NET_SCRIPT = `(function(){try{var a=globalThis.__mscopilotNet||[];globalThis.__mscopilotNet=[];return JSON.stringify(a);}catch(e){return "[]";}})()`;
+
 /**
  * 捕捉済みの substrate 宛 Bearer 群(URL付き)を JSON 文字列で返すスクリプト式。
  * サービスごとにスコープが異なるため、Node 側で Copilot(Chathub)用を選別する。
  */
 export const READ_BEARERS_SCRIPT = `JSON.stringify(globalThis.__mscopilotBearers || [])`;
 
-/** ページから採取した Bearer 1 件(t=JWT本体, u=リクエストURL)。 */
+/** ページから採取した Bearer 1 件(t=JWT本体, u=採取元URL, via=採取経路)。 */
 export interface HarvestedBearer {
   t: string;
   u: string;
+  via?: string;
+}
+
+/**
+ * 採取した Bearer 群を診断ログ用に 1 件 1 行で整形する(secret は含めない)。
+ * どのスコープのトークンが・どの経路で採れているかを可視化し、Copilot 用トークンの
+ * 有無を一目で判断できるようにする。score 降順。
+ */
+export function describeBearers(bearers: Array<HarvestedBearer | string>): string {
+  const now = Date.now();
+  const rows = bearers
+    .map((raw) => {
+      const b = typeof raw === "string" ? { t: raw, u: "", via: "" } : raw;
+      const payload = decodeJwt(b.t);
+      const exp = payload?.exp ? payload.exp * 1000 : undefined;
+      const score = scoreText(matchText({ secret: b.t, target: b.u }, payload));
+      return {
+        score,
+        via: b.via || "?",
+        aud: payload?.aud || "?",
+        scp: (payload?.scp || "").slice(0, 60),
+        exp,
+        expired: exp !== undefined ? exp <= now : undefined,
+        url: (b.u || "").split("?")[0].slice(0, 100),
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+  if (rows.length === 0) {
+    return "  (Bearer 候補は 1 件も採取していません)";
+  }
+  return rows
+    .map((r, i) => {
+      const mark = r.score >= 3 ? "★" : r.score === 2 ? "○" : "  ";
+      const exp = r.exp ? `${new Date(r.exp).toISOString()}${r.expired ? "(失効)" : ""}` : "?";
+      return (
+        `  ${mark} [${i}] score=${r.score} via=${r.via}\n` +
+        `        aud=${r.aud} scp=${r.scp}\n` +
+        `        exp=${exp} url=${r.url}`
+      );
+    })
+    .join("\n");
 }
 
 /**

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserSession } from "../bridge/browserSession";
+import { formatTokenScope } from "../bridge/browserSession";
 import type { MsCopilotConfig } from "../config";
 import { log } from "../logger";
 import { RUN_STREAM_SCRIPT } from "./injectedClient";
@@ -46,10 +47,26 @@ export class SubstrateClient {
   ) {}
 
   async ask(params: AskParams): Promise<AskResult> {
+    const ids = newSessionIds();
+    const reqId = ids.correlationId.slice(0, 8);
+    const t0 = Date.now();
+    log.info(`[${reqId}] ask 開始: forceToken=${!!params.forceToken} prompt=${params.prompt.length}字`);
+
     const token = await this.session.getToken(params.forceToken);
+    log.info(`[${reqId}] token: ${formatTokenScope(token)} exp=${new Date(token.expiresAt).toISOString()}`);
+    const scope = formatTokenScope(token);
+    if (/score=[01]\b/.test(scope)) {
+      log.warn(
+        `[${reqId}] ⚠ 採用トークンが Copilot 用と判別できません(score<2)。"Language model unavailable" の恐れ。`,
+      );
+    } else if (/score=2\b/.test(scope)) {
+      log.warn(
+        `[${reqId}] ⚠ 採用トークンは substrate 一般スコープ(score=2)。Copilot(Chathub)専用ではない可能性。`,
+      );
+    }
+
     const conversationId = params.conversationId ?? randomUUID();
     const isStartOfSession = !params.conversationId;
-    const ids = newSessionIds();
 
     // ページの実接続テンプレートが取れればそれを流用する(実 variants/token/scenario を使え、
     // 仕様変更に強い)。取れなければ実測値ベースの buildWsUrl でフォールバック。
@@ -57,9 +74,9 @@ export class SubstrateClient {
     const endpoint =
       (template && deriveWsUrlFromTemplate(template, conversationId, ids)) ||
       buildWsUrl(this.config.endpointVariant, token, conversationId, ids);
-    if (template) {
-      log.info("ws endpoint: ページ実接続テンプレートから生成しました");
-    }
+    log.info(
+      `[${reqId}] endpoint: ${template ? "実接続テンプレート流用" : "合成(buildWsUrl)"} host=${hostOf(endpoint.url)}`,
+    );
 
     const locale = localeInfo();
     const invocation = buildInvocation({
@@ -83,13 +100,17 @@ export class SubstrateClient {
     };
 
     log.info(
-      `ask: convId=${conversationId} start=${isStartOfSession} variant=${this.config.endpointVariant}`,
+      `[${reqId}] ask: convId=${conversationId} start=${isStartOfSession} variant=${this.config.endpointVariant} ` +
+        `handshake=${arg.handshake.length}B invocation=${arg.invocation.length}B`,
     );
-    log.info(`ws endpoint: ${redactToken(endpoint.url)}`);
+    log.info(`[${reqId}] ws url: ${redactToken(endpoint.url)}`);
 
     const assembler = new ResponseAssembler(params.onDelta);
     let resolvedConversationId = conversationId;
     let errorText: string | undefined;
+    let frameCount = 0;
+    let opened = false;
+    let handshakeAt = 0;
 
     const onFrame = (frame: unknown) => {
       const meta = frame as {
@@ -99,9 +120,15 @@ export class SubstrateClient {
         reason?: string;
       };
       if (meta?.__transport) {
+        if (meta.__transport === "open") {
+          opened = true;
+        }
+        if (meta.__transport === "handshake") {
+          handshakeAt = Date.now() - t0;
+        }
         log.info(
-          `transport: ${meta.__transport}` +
-            (meta.raw ? ` ${meta.raw}` : "") +
+          `[${reqId}] transport: ${meta.__transport} (+${Date.now() - t0}ms)` +
+            (meta.raw ? ` ${truncate(meta.raw, 200)}` : "") +
             (meta.code !== undefined ? ` code=${meta.code} reason=${meta.reason ?? ""}` : ""),
         );
         // 正常終了(1000)以外でクローズし、本文が無ければエラーとして扱う。
@@ -121,7 +148,8 @@ export class SubstrateClient {
         return;
       }
 
-      logRawFrame(frame);
+      frameCount++;
+      logRawFrame(reqId, frameCount, frame);
 
       const echoed = extractConversationId(frame);
       if (echoed) {
@@ -134,7 +162,7 @@ export class SubstrateClient {
       }
       if (interp.error) {
         errorText = interp.error;
-        log.warn(`frame error: ${interp.error}`);
+        log.warn(`[${reqId}] frame error: ${interp.error}`);
       }
       // writeAtCursor は差分なので末尾へ追記する。
       if (interp.appendText) {
@@ -158,7 +186,7 @@ export class SubstrateClient {
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      log.error("runStream failed", msg);
+      log.error(`[${reqId}] runStream failed`, msg);
       if (!errorText) {
         errorText = msg;
       }
@@ -167,19 +195,38 @@ export class SubstrateClient {
     // ストリーム終了。保留中の本文があれば最終判定(失敗フレーズなら error 化)して確定する。
     assembler.end();
     if (assembler.failure) {
-      log.warn(`service failure: ${assembler.failure}`);
+      log.warn(`[${reqId}] service failure(実応答ではない): ${assembler.failure}`);
+    }
+
+    const error = errorText ?? assembler.failure;
+    log.info(
+      `[${reqId}] ask 完了 (+${Date.now() - t0}ms): opened=${opened} handshake=${handshakeAt ? handshakeAt + "ms" : "無"} ` +
+        `frames=${frameCount} textLen=${assembler.text.length} produced=${assembler.produced} ` +
+        `failure=${assembler.failure ? "有" : "無"} error=${error ? `"${truncate(error, 120)}"` : "無"}`,
+    );
+    if (!opened && !error) {
+      log.warn(`[${reqId}] ⚠ WebSocket が open にならないまま終了(接続到達性/CSP/認証を確認)`);
     }
 
     return {
       text: assembler.text,
       conversationId: resolvedConversationId,
-      error: errorText ?? assembler.failure,
+      error,
     };
   }
 }
 
 function redactToken(url: string): string {
   return url.replace(/access_token=[^&]+/, "access_token=***");
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function hostOf(url: string): string {
+  const m = /^wss?:\/\/([^/]+)/i.exec(url);
+  return m ? m[1] : "?";
 }
 
 /** 実行環境の locale / timezone を invocation.message 用に取得する(取れなければ既定)。 */
@@ -196,10 +243,10 @@ function localeInfo(): { locale: string; timeZone: string; timeZoneOffset: numbe
   }
 }
 
-function logRawFrame(frame: unknown): void {
+function logRawFrame(reqId: string, n: number, frame: unknown): void {
   try {
     const s = JSON.stringify(frame);
-    log.info(`frame: ${s.length > 600 ? s.slice(0, 600) + "…" : s}`);
+    log.info(`[${reqId}] frame#${n}: ${truncate(s, 800)}`);
   } catch {
     /* ignore */
   }

@@ -9,11 +9,13 @@ import {
   HarvestedBearer,
   READ_BEARER_SCRIPT,
   READ_BEARERS_SCRIPT,
+  READ_NET_SCRIPT,
   READ_WS_URL_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
   WS_HOOK_SCRIPT,
+  describeBearers,
   formatInventory,
   formatTokenScope,
   inventoryTokens,
@@ -180,41 +182,87 @@ export class PlaywrightBridge implements BrowserSession {
     }
   }
 
+  /** 解析用ネットワークトレースを取り出す(読むたびにページ側でクリアされる)。 */
+  private async readNetTrace(): Promise<string[]> {
+    try {
+      if (!this.page) {
+        return [];
+      }
+      const json = String((await this.page.evaluate(READ_NET_SCRIPT)) || "[]");
+      const arr = JSON.parse(json);
+      return Array.isArray(arr) ? (arr as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
   /** 実テナントでは access_token が永続化されないため、3 経路を制限時間内で走査する。 */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
     const attempts = 4;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
+        log.info(`token: attempt ${attempt + 1}/${attempts} — ページを再読込します (pw force=${force})`);
         await this.page.reload({ waitUntil: "domcontentloaded" });
       }
       const budgetMs = attempt === 0 && !force ? 4000 : 12000;
-      const deadline = Date.now() + budgetMs;
-      do {
-        const storage = pickSydneyToken(await this.collectRawTokens());
-        if (storage && isTokenFresh(storage)) {
-          log.info(
-            `token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()} ${formatTokenScope(storage)}`,
-          );
-          return storage;
-        }
-        const bearer = pickBearerToken(await this.readHarvestedBearers());
-        if (bearer && isTokenFresh(bearer)) {
-          log.info(
-            `token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()} ${formatTokenScope(bearer)}`,
-          );
-          return bearer;
-        }
-        const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
-        if (wsToken && isTokenFresh(wsToken)) {
-          log.info(
-            `token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()} ${formatTokenScope(wsToken)}`,
-          );
-          return wsToken;
-        }
-        await delay(750);
-      } while (Date.now() < deadline);
+      const token = await this.pollTokenSources(budgetMs);
+      await this.logHarvestSnapshot(`pw attempt ${attempt + 1}${token ? " ✓" : ""}`);
+      if (token) {
+        return token;
+      }
     }
     return undefined;
+  }
+
+  /** 制限時間内で 3 経路を繰り返し走査し、最初に得られた有効トークンを返す。 */
+  private async pollTokenSources(budgetMs: number): Promise<SubstrateToken | undefined> {
+    const deadline = Date.now() + budgetMs;
+    do {
+      const storage = pickSydneyToken(await this.collectRawTokens());
+      if (storage && isTokenFresh(storage)) {
+        log.info(
+          `token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()} ${formatTokenScope(storage)}`,
+        );
+        return storage;
+      }
+      const bearer = pickBearerToken(await this.readHarvestedBearers());
+      if (bearer && isTokenFresh(bearer)) {
+        log.info(
+          `token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()} ${formatTokenScope(bearer)}`,
+        );
+        return bearer;
+      }
+      const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
+      if (wsToken && isTokenFresh(wsToken)) {
+        log.info(
+          `token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()} ${formatTokenScope(wsToken)}`,
+        );
+        return wsToken;
+      }
+      await delay(750);
+    } while (Date.now() < deadline);
+    return undefined;
+  }
+
+  /**
+   * 採取状況を診断ログへ大量に出す。どの経路で・どのスコープのトークンが採れているか、
+   * ページがどんな substrate/認証通信・WebSocket を張ったかを可視化する。
+   */
+  private async logHarvestSnapshot(tag: string): Promise<void> {
+    try {
+      const bearers = await this.readHarvestedBearers();
+      const wsUrl = await this.readHarvestedUrl();
+      const storage = (await this.collectRawTokens()).length;
+      log.info(`── harvest snapshot [${tag}] ──`);
+      log.info(`  MSAL storage 候補: ${storage} 件 / 実接続WS: ${wsUrl ? "捕捉済み" : "未捕捉"}`);
+      log.info(`  Bearer 候補 ${bearers.length} 件(★=Copilot想定 score3 / ○=substrate score2):\n${describeBearers(bearers)}`);
+      const net = await this.readNetTrace();
+      if (net.length) {
+        log.info(`  ネットワークトレース ${net.length} 件:\n${net.map((s) => "    " + s).join("\n")}`);
+      }
+    } catch (e) {
+      log.warn("harvest snapshot 失敗", e as Error);
+    }
   }
 
   private async logTokenInventory(): Promise<void> {
@@ -222,7 +270,9 @@ export class PlaywrightBridge implements BrowserSession {
       const href = await this.currentUrl();
       const inv = inventoryTokens(await this.collectRawTokens());
       log.warn(`token 取得失敗。現在のページ: ${href || "(不明)"}`);
-      log.warn(`検出したトークン候補 ${inv.length} 件:\n${formatInventory(inv)}`);
+      log.warn(`MSAL 候補 ${inv.length} 件:\n${formatInventory(inv)}`);
+      const bearers = await this.readHarvestedBearers();
+      log.warn(`HTTP/WS Bearer 候補 ${bearers.length} 件:\n${describeBearers(bearers)}`);
     } catch (e) {
       log.warn("token inventory の収集に失敗", e as Error);
     }
