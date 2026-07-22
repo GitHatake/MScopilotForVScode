@@ -92,10 +92,16 @@ export class ChatController {
     }
 
     if (result.error && !received) {
-      stream.markdown(
-        `\n\n⚠️ Copilot からの応答取得に失敗しました: \`${result.error}\`\n\n` +
-          "「MS Copilot: ログを表示」で詳細を確認できます。",
-      );
+      if (result.hint) {
+        // Copilot 用トークン未採取など、ユーザーの操作で解決できる場合は行動指示を前面に出す。
+        stream.markdown(`\n\n⚠️ **${result.hint}**\n\n`);
+        stream.markdown(`<sub>詳細: \`${result.error}\` /「MS Copilot: ログを表示」</sub>`);
+      } else {
+        stream.markdown(
+          `\n\n⚠️ Copilot からの応答取得に失敗しました: \`${result.error}\`\n\n` +
+            "「MS Copilot: ログを表示」で詳細を確認できます。",
+        );
+      }
     }
 
     // 会話状態を更新して永続化。

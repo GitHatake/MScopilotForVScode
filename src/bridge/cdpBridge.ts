@@ -10,10 +10,12 @@ import {
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
   HarvestedBearer,
+  PRIME_COPILOT_GUIDANCE,
   READ_BEARER_SCRIPT,
   READ_BEARERS_SCRIPT,
   READ_NET_SCRIPT,
   READ_WS_URL_SCRIPT,
+  READ_WS_URLS_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
@@ -24,8 +26,9 @@ import {
   inventoryTokens,
   isTokenFresh,
   parseWsUrlToken,
-  pickBearerToken,
+  pickBearerTokenScored,
   pickSydneyToken,
+  scoreToken,
 } from "./browserSession";
 
 /**
@@ -40,6 +43,13 @@ import {
 export class CdpBridge implements BrowserSession {
   private client: any | undefined;
   private readonly workProfile: string;
+  /**
+   * ユーザーが Web の Copilot で送信した時に捕捉した実接続テンプレート(access_token 付き URL)と
+   * そこから導いた Copilot 用トークン。ページ再読込で page 側の globalThis は消えるため Node 側で
+   * 保持し、失効するまで再利用する(=一度プライムすれば以後は自動で使える)。
+   */
+  private copilotTemplate: string | undefined;
+  private copilotToken: SubstrateToken | undefined;
 
   constructor(
     private readonly config: MsCopilotConfig,
@@ -131,11 +141,55 @@ export class CdpBridge implements BrowserSession {
 
   async harvestWsTemplate(): Promise<string | undefined> {
     await this.ensureReady();
-    // 非ブロッキングで読むだけ。実接続 URL は force トークン再取得時の reload や signIn で
-    // 採取される(そこで __mscopilotWsUrl が入る)。ここで能動的に再読込すると発信が数十秒
-    // ブロックしてしまうため行わない。
+    // 保持済みの実接続テンプレートが失効前ならそれを最優先で使う(再読込を跨いでも生き残る)。
+    if (this.copilotToken && isTokenFresh(this.copilotToken) && this.copilotTemplate) {
+      return this.copilotTemplate;
+    }
+    // 未保持ならページから採取を試みる(非ブロッキング。能動再読込はしない)。
+    await this.captureCopilot();
+    if (this.copilotTemplate) {
+      return this.copilotTemplate;
+    }
     const url = await this.readHarvestedUrl();
     return url || undefined;
+  }
+
+  /** 捕捉済みの Chathub 実接続 URL 群(新しい順)を読む。 */
+  private async readHarvestedUrls(): Promise<string[]> {
+    if (!this.client) {
+      return [];
+    }
+    const json = await this.evaluate<string>(READ_WS_URLS_SCRIPT).catch(() => "[]");
+    try {
+      const arr = JSON.parse(json || "[]");
+      return Array.isArray(arr) ? (arr as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * ページが張った Copilot(Chathub)実接続 URL からトークン+テンプレートを採取し Node 側に保持する。
+   * 見つかれば true。これがユーザーの「ブラウザで一度送信」で Copilot トークンを得る唯一の経路。
+   */
+  private async captureCopilot(): Promise<boolean> {
+    if (this.copilotToken && isTokenFresh(this.copilotToken)) {
+      return true;
+    }
+    const urls = await this.readHarvestedUrls();
+    const single = await this.readHarvestedUrl();
+    for (const url of [...urls, single]) {
+      const token = parseWsUrlToken(url);
+      if (token && isTokenFresh(token)) {
+        this.copilotTemplate = url;
+        this.copilotToken = token;
+        log.info(
+          `Copilot 実接続を捕捉しました(以後再利用): ${formatTokenScope(token, url)} exp=${new Date(token.expiresAt).toISOString()}`,
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   async harvestBearer(): Promise<string | undefined> {
@@ -182,7 +236,15 @@ export class CdpBridge implements BrowserSession {
    *  3) ページ実接続の WebSocket URL からの採取(実接続が張られていれば最も確実)
    */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
+    // プライム済み(過去にユーザーが Web で送信して捕捉した)Copilot トークンが失効前なら、
+    // 再読込せずに最優先で使う。force 再取得でも再読込するとプライムが消えるため、これを先に返す。
+    if (await this.captureCopilot()) {
+      log.info(`token acquired (copilot-primed): ${formatTokenScope(this.copilotToken!, this.copilotTemplate)}`);
+      return this.copilotToken;
+    }
+
     const attempts = 4;
+    let fallback: SubstrateToken | undefined; // Copilot 未採取時のみ使う substrate 一般トークン
     for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
         log.info(`token: attempt ${attempt + 1}/${attempts} — ページを再読込します (force=${force})`);
@@ -191,14 +253,30 @@ export class CdpBridge implements BrowserSession {
       // 読込直後は substrate への実トラフィックが立ち上がるまで間がある。
       // 初回は短め、再読込後はページ全体が動くまで長めに待つ。
       const budgetMs = attempt === 0 && !force ? 4000 : 12000;
-      const token = await this.pollTokenSources(budgetMs);
+      const found = await this.pollTokenSources(budgetMs);
       // 採取状況を毎回スナップショット(Copilot 用トークンが採れているか解析できるように)。
-      await this.logHarvestSnapshot(`attempt ${attempt + 1}${token ? " ✓" : ""}`);
-      if (token) {
-        return token;
+      await this.logHarvestSnapshot(`attempt ${attempt + 1}${found ? " ✓" : ""}`);
+      if (found?.isCopilot) {
+        return found.token; // Copilot(score>=3)確定 → 即採用
+      }
+      if (found && !fallback) {
+        fallback = found.token; // substrate 一般(/search 等)。より良い物が出るまで保留。
+      }
+      // fallback を得たら以降の再読込は打ち切る(Copilot トークンはユーザーが Web で送信した時
+      // にしか出ず、再読込では出ない)。速やかに送信を試し、失敗時は hint で操作を促す。
+      if (fallback) {
+        break;
       }
     }
-    return undefined;
+    // Copilot 用トークンは採れなかった。fallback(あれば)を返しつつ、行動指示をログに出す。
+    if (fallback) {
+      log.warn(
+        `token: Copilot 用トークンを採取できませんでした。substrate 一般トークンで送信を試みます` +
+          `(スコープ不一致だと "Language model unavailable" になります)。`,
+      );
+      log.warn(`token: ${PRIME_COPILOT_GUIDANCE}`);
+    }
+    return fallback;
   }
 
   /**
@@ -235,28 +313,45 @@ export class CdpBridge implements BrowserSession {
     }
   }
 
-  /** 制限時間内で 3 経路を繰り返し走査し、最初に得られた有効トークンを返す。 */
-  private async pollTokenSources(budgetMs: number): Promise<SubstrateToken | undefined> {
+  /**
+   * 制限時間内で 3 経路を繰り返し走査する。Copilot(score>=3)が出れば即返す。出なければ
+   * substrate 一般(score<=2)を「fallback」として保持し、時間切れ時に返す(即断で /search を
+   * 掴んで送信失敗するのを避けつつ、Copilot 採取を待つ)。
+   */
+  private async pollTokenSources(
+    budgetMs: number,
+  ): Promise<{ token: SubstrateToken; isCopilot: boolean } | undefined> {
     const deadline = Date.now() + budgetMs;
+    let fallback: { token: SubstrateToken; isCopilot: boolean } | undefined;
     do {
+      // 1) 実接続 WebSocket(Copilot 確定)。最優先。
+      if (await this.captureCopilot()) {
+        logAcquired("ws-harvest", this.copilotToken!, this.copilotTemplate);
+        return { token: this.copilotToken!, isCopilot: true };
+      }
+      // 2) HTTP/WS-URL の Bearer 群。採取元 URL 込みでスコアリングし Copilot を優先。
+      const scored = pickBearerTokenScored(await this.readHarvestedBearers());
+      if (scored && isTokenFresh(scored.token)) {
+        const via = scored.score >= 3 ? "http-bearer(copilot)" : "http-bearer";
+        logAcquired(via, scored.token, scored.url);
+        if (scored.score >= 3) {
+          return { token: scored.token, isCopilot: true };
+        }
+        fallback = fallback ?? { token: scored.token, isCopilot: false };
+      }
+      // 3) MSAL ストレージ。
       const storage = pickSydneyToken(await this.collectRawTokens());
       if (storage && isTokenFresh(storage)) {
-        logAcquired("storage", storage);
-        return storage;
-      }
-      const bearer = pickBearerToken(await this.readHarvestedBearers());
-      if (bearer && isTokenFresh(bearer)) {
-        logAcquired("http-bearer", bearer);
-        return bearer;
-      }
-      const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
-      if (wsToken && isTokenFresh(wsToken)) {
-        logAcquired("ws-harvest", wsToken);
-        return wsToken;
+        const score = scoreToken(storage);
+        logAcquired(score >= 3 ? "storage(copilot)" : "storage", storage);
+        if (score >= 3) {
+          return { token: storage, isCopilot: true };
+        }
+        fallback = fallback ?? { token: storage, isCopilot: false };
       }
       await delay(750);
     } while (Date.now() < deadline);
-    return undefined;
+    return fallback;
   }
 
   private async logTokenInventory(): Promise<void> {
@@ -267,6 +362,7 @@ export class CdpBridge implements BrowserSession {
       log.warn(`MSAL 候補 ${inv.length} 件:\n${formatInventory(inv)}`);
       const bearers = await this.readHarvestedBearers();
       log.warn(`HTTP/WS Bearer 候補 ${bearers.length} 件:\n${describeBearers(bearers)}`);
+      log.warn(PRIME_COPILOT_GUIDANCE);
     } catch (e) {
       log.warn("token inventory の収集に失敗", e as Error);
     }
@@ -575,10 +671,10 @@ function findBrowser(): string | undefined {
   return candidates.find((p) => p && existsSync(p));
 }
 
-function logAcquired(via: string, token: SubstrateToken): void {
+function logAcquired(via: string, token: SubstrateToken, target?: string): void {
   log.info(
     `token acquired (${via}): oid=${token.objectId.slice(0, 8)}… tid=${token.tenantId.slice(0, 8)}… ` +
-      `exp=${new Date(token.expiresAt).toISOString()} ${formatTokenScope(token)}`,
+      `exp=${new Date(token.expiresAt).toISOString()} ${formatTokenScope(token, target)}`,
   );
 }
 

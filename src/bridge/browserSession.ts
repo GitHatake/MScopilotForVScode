@@ -430,6 +430,9 @@ export const WS_HOOK_SCRIPT = `(() => {
 /** 捕捉済みの substrate 接続 URL を返すスクリプト式(無ければ空文字)。 */
 export const READ_WS_URL_SCRIPT = `(globalThis.__mscopilotWsUrl || "")`;
 
+/** 捕捉済みの Chathub 実接続 URL を全件(新しい順)JSON で返すスクリプト式。 */
+export const READ_WS_URLS_SCRIPT = `JSON.stringify((globalThis.__mscopilotWsUrls || []).slice().reverse())`;
+
 /** 捕捉済みの substrate 宛 Bearer トークン(JWT 本体)を返すスクリプト式(無ければ空文字)。 */
 export const READ_BEARER_SCRIPT = `(globalThis.__mscopilotBearer || "")`;
 
@@ -510,14 +513,60 @@ export function pickBearerToken(bearers: Array<HarvestedBearer | string>): Subst
   return pickSydneyToken(candidates);
 }
 
+/**
+ * トークンの選別スコアを返す。provenance(採取元 URL)が分かる場合は併せて照合する。
+ * WebSocket URL や Copilot REST の URL には m365Copilot/Chathub が含まれるため、トークン単体の
+ * claim では score=2 でも、採取元 URL 込みなら Copilot(score=3)と正しく判定できる。
+ */
+export function scoreToken(token: SubstrateToken, target?: string): number {
+  const payload = decodeJwt(token.accessToken);
+  return scoreText(matchText({ secret: token.accessToken, target }, payload));
+}
+
 /** トークンの素性(aud / scp / 選別スコア)を診断ログ用に整形する。secret は含めない。 */
-export function formatTokenScope(token: SubstrateToken): string {
+export function formatTokenScope(token: SubstrateToken, target?: string): string {
   const payload = decodeJwt(token.accessToken);
   const aud = payload?.aud || "?";
   const scp = (payload?.scp || "").slice(0, 80);
-  const score = scoreText(matchText({ secret: token.accessToken }, payload));
+  const score = scoreText(matchText({ secret: token.accessToken, target }, payload));
   return `aud=${aud} scp=${scp} score=${score}`;
 }
+
+/**
+ * 採取した Bearer 群から最良トークンを選び、その選別スコア(採取元 URL 込み)も返す。
+ * score>=3 なら Copilot(Chathub)用と判定でき、score<=2 は substrate 一般(/search 等)。
+ */
+export function pickBearerTokenScored(
+  bearers: Array<HarvestedBearer | string>,
+): { token: SubstrateToken; score: number; url: string } | undefined {
+  const token = pickBearerToken(bearers);
+  if (!token) {
+    return undefined;
+  }
+  const match = bearers.find(
+    (b): b is HarvestedBearer => typeof b !== "string" && b.t === token.accessToken,
+  );
+  const url = match?.u || "";
+  return { token, score: scoreToken(token, url), url };
+}
+
+/**
+ * 採取した WebSocket URL が Copilot(Chathub)実接続か判定する。
+ * この URL のクエリの access_token が唯一の Copilot 用トークン供給源。
+ */
+export function isCopilotWsUrl(url: string): boolean {
+  return /\/Chathub\//i.test(url) && /access_token=/i.test(url);
+}
+
+/**
+ * Copilot 用トークン未採取時にユーザーへ提示する行動指示。実測(feedback_4/5/6)より、
+ * Copilot 用トークンは HTTP には現れず、ユーザーが Web の Copilot チャットで実際に送信して
+ * WebSocket が張られた時にのみ生成される。よって「ブラウザで一度送信」が唯一確実な採取手段。
+ */
+export const PRIME_COPILOT_GUIDANCE =
+  "Copilot 用トークンをまだ採取できていません(HTTP 経路には検索用トークンしか流れないため)。" +
+  "開いているブラウザの M365 Copilot チャットで一度メッセージを送信してから、VS Code 側でもう一度お試しください。" +
+  "一度送信すると Copilot の WebSocket 接続からトークンを採取でき、以降は自動で使えます。";
 
 /**
  * JWT 本体(secret)から SubstrateToken を組み立てる。oid/tid が読めない JWT は対象外。

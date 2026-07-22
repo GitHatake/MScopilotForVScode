@@ -4,6 +4,9 @@ import assert from "node:assert";
 import {
   pickSydneyToken,
   pickBearerToken,
+  pickBearerTokenScored,
+  scoreToken,
+  isCopilotWsUrl,
   describeBearers,
   formatTokenScope,
   inventoryTokens,
@@ -196,6 +199,33 @@ ok("describeBearers は score 降順で整形し secret を漏らさない(feedb
 });
 ok("describeBearers は候補ゼロでも安全なメッセージを返す", () => {
   assert.ok(describeBearers([]).includes("1 件も採取していません"));
+});
+ok("scoreToken は採取元 URL 込みで Copilot を score3 と判定(feedback_6 の核心)", () => {
+  // claim だけでは substrate 一般(score2)でも、Chathub URL 由来なら Copilot(score3)。
+  const tok = jwt({ aud: "https://substrate.office.com", oid: "o", tid: "t", exp: FUTURE });
+  const wsUrl = "wss://substrate.office.com/m365Copilot/Chathub/o@t?access_token=x";
+  assert.equal(scoreToken({ accessToken: tok, objectId: "o", tenantId: "t", expiresAt: FUTURE * 1000 }), 2);
+  assert.equal(scoreToken({ accessToken: tok, objectId: "o", tenantId: "t", expiresAt: FUTURE * 1000 }, wsUrl), 3);
+});
+ok("pickBearerTokenScored は選んだトークンのスコアと採取元URLを返す", () => {
+  const search = jwt({ aud: "https://substrate.office.com/search", oid: "o", tid: "t", exp: FUTURE });
+  // /search のみ → score2(Copilot ではない=送信前に掴んでも Language model unavailable)。
+  const only = pickBearerTokenScored([{ t: search, u: "https://substrate.office.com/search/api" }]);
+  assert.ok(only);
+  assert.equal(only!.score, 2);
+  // Copilot URL の Bearer が加わると score3 の方を選ぶ。
+  const copilot = jwt({ aud: "https://substrate.office.com", oid: "o", tid: "t", exp: FUTURE });
+  const both = pickBearerTokenScored([
+    { t: search, u: "https://substrate.office.com/search/api" },
+    { t: copilot, u: "https://substrate.office.com/m365Copilot/Chathub/o@t?access_token=x" },
+  ]);
+  assert.equal(both!.score, 3);
+  assert.equal(both!.token.accessToken, copilot);
+});
+ok("isCopilotWsUrl は Chathub 実接続 URL のみ true", () => {
+  assert.ok(isCopilotWsUrl("wss://substrate.office.com/m365Copilot/Chathub/o@t?access_token=x"));
+  assert.ok(!isCopilotWsUrl("wss://substrate.office.com/search?foo=1"));
+  assert.ok(!isCopilotWsUrl("wss://substrate.office.com/m365Copilot/Chathub/o@t")); // token 無しは対象外
 });
 
 console.log("応答組み立て / 失敗検出:");

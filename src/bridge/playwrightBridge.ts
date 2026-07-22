@@ -7,10 +7,12 @@ import {
   BrowserSessionError,
   COLLECT_TOKENS_SCRIPT,
   HarvestedBearer,
+  PRIME_COPILOT_GUIDANCE,
   READ_BEARER_SCRIPT,
   READ_BEARERS_SCRIPT,
   READ_NET_SCRIPT,
   READ_WS_URL_SCRIPT,
+  READ_WS_URLS_SCRIPT,
   RawTokenCandidate,
   RunStreamOptions,
   SubstrateToken,
@@ -21,8 +23,9 @@ import {
   inventoryTokens,
   isTokenFresh,
   parseWsUrlToken,
-  pickBearerToken,
+  pickBearerTokenScored,
   pickSydneyToken,
+  scoreToken,
 } from "./browserSession";
 
 /**
@@ -35,6 +38,10 @@ export class PlaywrightBridge implements BrowserSession {
   private page: any | undefined;
   private readonly streams = new Map<string, (frame: unknown) => void>();
   private readonly profileDir: string;
+  /** ユーザーが Web の Copilot で送信した時に捕捉した実接続テンプレートと Copilot 用トークン。
+   *  ページ再読込で page 側 globalThis は消えるため Node 側で保持し失効まで再利用する。 */
+  private copilotTemplate: string | undefined;
+  private copilotToken: SubstrateToken | undefined;
 
   constructor(
     private readonly config: MsCopilotConfig,
@@ -140,10 +147,50 @@ export class PlaywrightBridge implements BrowserSession {
 
   async harvestWsTemplate(): Promise<string | undefined> {
     await this.ensureReady();
-    // 非ブロッキングで読むだけ。実接続 URL は force トークン再取得時の reload や signIn で採取される。
-    // ここで能動的に再読込すると発信が数十秒ブロックするため行わない。
+    if (this.copilotToken && isTokenFresh(this.copilotToken) && this.copilotTemplate) {
+      return this.copilotTemplate;
+    }
+    await this.captureCopilot();
+    if (this.copilotTemplate) {
+      return this.copilotTemplate;
+    }
     const url = await this.readHarvestedUrl();
     return url || undefined;
+  }
+
+  /** 捕捉済みの Chathub 実接続 URL 群(新しい順)を読む。 */
+  private async readHarvestedUrls(): Promise<string[]> {
+    try {
+      if (!this.page) {
+        return [];
+      }
+      const json = String((await this.page.evaluate(READ_WS_URLS_SCRIPT)) || "[]");
+      const arr = JSON.parse(json);
+      return Array.isArray(arr) ? (arr as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** ページが張った Copilot 実接続 URL からトークン+テンプレートを採取し Node 側に保持する。 */
+  private async captureCopilot(): Promise<boolean> {
+    if (this.copilotToken && isTokenFresh(this.copilotToken)) {
+      return true;
+    }
+    const urls = await this.readHarvestedUrls();
+    const single = await this.readHarvestedUrl();
+    for (const url of [...urls, single]) {
+      const token = parseWsUrlToken(url);
+      if (token && isTokenFresh(token)) {
+        this.copilotTemplate = url;
+        this.copilotToken = token;
+        log.info(
+          `Copilot 実接続を捕捉しました(以後再利用): ${formatTokenScope(token, url)} exp=${new Date(token.expiresAt).toISOString()}`,
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   async harvestBearer(): Promise<string | undefined> {
@@ -198,50 +245,77 @@ export class PlaywrightBridge implements BrowserSession {
 
   /** 実テナントでは access_token が永続化されないため、3 経路を制限時間内で走査する。 */
   private async acquireToken(force: boolean): Promise<SubstrateToken | undefined> {
+    // プライム済み Copilot トークンが失効前なら再読込せず最優先で使う。
+    if (await this.captureCopilot()) {
+      log.info(`token acquired (pw copilot-primed): ${formatTokenScope(this.copilotToken!, this.copilotTemplate)}`);
+      return this.copilotToken;
+    }
+
     const attempts = 4;
+    let fallback: SubstrateToken | undefined;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if ((force && attempt === 0) || attempt > 0) {
         log.info(`token: attempt ${attempt + 1}/${attempts} — ページを再読込します (pw force=${force})`);
         await this.page.reload({ waitUntil: "domcontentloaded" });
       }
       const budgetMs = attempt === 0 && !force ? 4000 : 12000;
-      const token = await this.pollTokenSources(budgetMs);
-      await this.logHarvestSnapshot(`pw attempt ${attempt + 1}${token ? " ✓" : ""}`);
-      if (token) {
-        return token;
+      const found = await this.pollTokenSources(budgetMs);
+      await this.logHarvestSnapshot(`pw attempt ${attempt + 1}${found ? " ✓" : ""}`);
+      if (found?.isCopilot) {
+        return found.token;
+      }
+      if (found && !fallback) {
+        fallback = found.token;
+      }
+      if (fallback) {
+        break; // fallback を得たら再読込は打ち切る(Copilot は Web 送信でしか出ない)。
       }
     }
-    return undefined;
+    if (fallback) {
+      log.warn(
+        `token: Copilot 用トークンを採取できませんでした。substrate 一般トークンで送信を試みます` +
+          `(スコープ不一致だと "Language model unavailable" になります)。`,
+      );
+      log.warn(`token: ${PRIME_COPILOT_GUIDANCE}`);
+    }
+    return fallback;
   }
 
-  /** 制限時間内で 3 経路を繰り返し走査し、最初に得られた有効トークンを返す。 */
-  private async pollTokenSources(budgetMs: number): Promise<SubstrateToken | undefined> {
+  /**
+   * 制限時間内で 3 経路を繰り返し走査。Copilot(score>=3)が出れば即返す。出なければ substrate
+   * 一般(score<=2)を fallback として保持し時間切れ時に返す。
+   */
+  private async pollTokenSources(
+    budgetMs: number,
+  ): Promise<{ token: SubstrateToken; isCopilot: boolean } | undefined> {
     const deadline = Date.now() + budgetMs;
+    let fallback: { token: SubstrateToken; isCopilot: boolean } | undefined;
     do {
+      if (await this.captureCopilot()) {
+        log.info(`token acquired (pw ws-harvest): ${formatTokenScope(this.copilotToken!, this.copilotTemplate)}`);
+        return { token: this.copilotToken!, isCopilot: true };
+      }
+      const scored = pickBearerTokenScored(await this.readHarvestedBearers());
+      if (scored && isTokenFresh(scored.token)) {
+        const via = scored.score >= 3 ? "pw http-bearer(copilot)" : "pw http-bearer";
+        log.info(`token acquired (${via}): ${formatTokenScope(scored.token, scored.url)}`);
+        if (scored.score >= 3) {
+          return { token: scored.token, isCopilot: true };
+        }
+        fallback = fallback ?? { token: scored.token, isCopilot: false };
+      }
       const storage = pickSydneyToken(await this.collectRawTokens());
       if (storage && isTokenFresh(storage)) {
-        log.info(
-          `token acquired (pw storage): exp=${new Date(storage.expiresAt).toISOString()} ${formatTokenScope(storage)}`,
-        );
-        return storage;
-      }
-      const bearer = pickBearerToken(await this.readHarvestedBearers());
-      if (bearer && isTokenFresh(bearer)) {
-        log.info(
-          `token acquired (pw http-bearer): exp=${new Date(bearer.expiresAt).toISOString()} ${formatTokenScope(bearer)}`,
-        );
-        return bearer;
-      }
-      const wsToken = parseWsUrlToken(await this.readHarvestedUrl());
-      if (wsToken && isTokenFresh(wsToken)) {
-        log.info(
-          `token acquired (pw ws-harvest): exp=${new Date(wsToken.expiresAt).toISOString()} ${formatTokenScope(wsToken)}`,
-        );
-        return wsToken;
+        const score = scoreToken(storage);
+        log.info(`token acquired (pw storage${score >= 3 ? "(copilot)" : ""}): ${formatTokenScope(storage)}`);
+        if (score >= 3) {
+          return { token: storage, isCopilot: true };
+        }
+        fallback = fallback ?? { token: storage, isCopilot: false };
       }
       await delay(750);
     } while (Date.now() < deadline);
-    return undefined;
+    return fallback;
   }
 
   /**
@@ -273,6 +347,7 @@ export class PlaywrightBridge implements BrowserSession {
       log.warn(`MSAL 候補 ${inv.length} 件:\n${formatInventory(inv)}`);
       const bearers = await this.readHarvestedBearers();
       log.warn(`HTTP/WS Bearer 候補 ${bearers.length} 件:\n${describeBearers(bearers)}`);
+      log.warn(PRIME_COPILOT_GUIDANCE);
     } catch (e) {
       log.warn("token inventory の収集に失敗", e as Error);
     }

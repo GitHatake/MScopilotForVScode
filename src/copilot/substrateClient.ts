@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserSession } from "../bridge/browserSession";
-import { formatTokenScope } from "../bridge/browserSession";
+import { PRIME_COPILOT_GUIDANCE, formatTokenScope } from "../bridge/browserSession";
 import type { MsCopilotConfig } from "../config";
 import { log } from "../logger";
 import { RUN_STREAM_SCRIPT } from "./injectedClient";
@@ -34,6 +34,8 @@ export interface AskResult {
   text: string;
   conversationId: string;
   error?: string;
+  /** ユーザーへ提示すべき行動指示(例: Copilot 用トークン未採取 → ブラウザで一度送信)。 */
+  hint?: string;
 }
 
 /**
@@ -53,17 +55,6 @@ export class SubstrateClient {
     log.info(`[${reqId}] ask 開始: forceToken=${!!params.forceToken} prompt=${params.prompt.length}字`);
 
     const token = await this.session.getToken(params.forceToken);
-    log.info(`[${reqId}] token: ${formatTokenScope(token)} exp=${new Date(token.expiresAt).toISOString()}`);
-    const scope = formatTokenScope(token);
-    if (/score=[01]\b/.test(scope)) {
-      log.warn(
-        `[${reqId}] ⚠ 採用トークンが Copilot 用と判別できません(score<2)。"Language model unavailable" の恐れ。`,
-      );
-    } else if (/score=2\b/.test(scope)) {
-      log.warn(
-        `[${reqId}] ⚠ 採用トークンは substrate 一般スコープ(score=2)。Copilot(Chathub)専用ではない可能性。`,
-      );
-    }
 
     const conversationId = params.conversationId ?? randomUUID();
     const isStartOfSession = !params.conversationId;
@@ -74,6 +65,21 @@ export class SubstrateClient {
     const endpoint =
       (template && deriveWsUrlFromTemplate(template, conversationId, ids)) ||
       buildWsUrl(this.config.endpointVariant, token, conversationId, ids);
+
+    // スコープ判定は採取元(テンプレート URL)込みで行う。Copilot トークンは claim だけだと
+    // substrate 一般(score2)に見えるが、Chathub URL 由来と分かれば Copilot(score3)と確定できる。
+    const scope = formatTokenScope(token, template);
+    log.info(`[${reqId}] token: ${scope} exp=${new Date(token.expiresAt).toISOString()}`);
+    if (/score=[01]\b/.test(scope)) {
+      log.warn(
+        `[${reqId}] ⚠ 採用トークンが Copilot 用と判別できません(score<2)。"Language model unavailable" の恐れ。`,
+      );
+    } else if (/score=2\b/.test(scope)) {
+      log.warn(
+        `[${reqId}] ⚠ 採用トークンは substrate 一般スコープ(score=2)。Copilot(Chathub)専用ではない可能性。` +
+          " ブラウザの Copilot で一度送信するとスコープ一致トークンを採取できます。",
+      );
+    }
     log.info(
       `[${reqId}] endpoint: ${template ? "実接続テンプレート流用" : "合成(buildWsUrl)"} host=${hostOf(endpoint.url)}`,
     );
@@ -208,10 +214,19 @@ export class SubstrateClient {
       log.warn(`[${reqId}] ⚠ WebSocket が open にならないまま終了(接続到達性/CSP/認証を確認)`);
     }
 
+    // "Language model unavailable" を Copilot 非対応スコープ(score<=2)で受けた場合、
+    // 原因はトークンのスコープ。ユーザーに「ブラウザで一度送信」を促す(唯一の採取手段)。
+    let hint: string | undefined;
+    if (assembler.failure && /score=[012]\b/.test(scope)) {
+      hint = PRIME_COPILOT_GUIDANCE;
+      log.warn(`[${reqId}] hint: ${hint}`);
+    }
+
     return {
       text: assembler.text,
       conversationId: resolvedConversationId,
       error,
+      hint,
     };
   }
 }
